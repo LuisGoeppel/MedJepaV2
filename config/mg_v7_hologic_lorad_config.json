@@ -13,7 +13,8 @@
     "train_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_train.csv",
     "val_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_val.csv",
     "test_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_test.csv",
-    "augmentation_config": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/luis/config/mg_lejepa_aug_v4.json"
+    "augmentation_config": "mg_lejepa_aug_v4.json",
+    "analysis_config": "analysis.json"
   },
   "model": {
     "backbone_name": "vit_small_patch16_224",

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medjepa"
+version = "0.1.0"
+description = "Mammography LeJEPA training and transfer experiments"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4", "torchvision", "timm", "numpy", "pandas",
+    "scikit-learn", "matplotlib", "tqdm",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "ruff"]
+opencv = ["opencv-python-headless"]
+
+[tool.setuptools.packages.find]
+include = ["core*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["F"]

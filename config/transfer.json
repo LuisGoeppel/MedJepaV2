@@ -1,0 +1,20 @@
+{
+  "checkpoint": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/luis/runs/mg_v7_hologic_lorad_50ep_test_v4/models/final_lejepa_checkpoint.pt",
+  "full_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/mg-only-all.csv",
+  "bin_path": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/mg-only-all.bin",
+  "train_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_train.csv",
+  "val_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_val.csv",
+  "test_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_test.csv",
+  "aug_config": "mg_lejepa_aug_v4.json",
+  "output_dir": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/luis/runs/transfer_label_efficiency_v2",
+  "subset_sizes": ["2000", "5000", "10000", "25000", "50000", "full"],
+  "modes": ["random", "frozen_jepa", "finetune_jepa"],
+  "auto_model_from_checkpoint": true,
+  "subset_strategy": "progressive",
+  "balance_curve": "log",
+  "epochs": 100,
+  "patience": 15,
+  "head_warmup_epochs": 5,
+  "num_seeds": 1,
+  "seed": 42
+}

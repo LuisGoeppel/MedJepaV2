@@ -1,0 +1,29 @@
+{
+  "seed": 42,
+  "feature_extraction": {
+    "batch_size": 256,
+    "num_workers": 4,
+    "save_features": false
+  },
+  "pca": {
+    "enabled": true,
+    "split": "test",
+    "max_samples": 5000,
+    "sampling": "balanced_collapsed",
+    "max_categories": 12,
+    "include_raw_columns": false
+  },
+  "probe": {
+    "enabled": true,
+    "targets": ["dataset", "machine", "view", "laterality", "collapsed_birads"],
+    "probe_epochs": 50,
+    "probe_batch_size": 1024,
+    "probe_learning_rate": 0.001,
+    "probe_weight_decay": 1e-7,
+    "probe_train_max_samples": 60000,
+    "no_class_weights": false,
+    "select_best_by": "val_macro_f1",
+    "machine_min_train_count": 20,
+    "machine_top_k": 0
+  }
+}
