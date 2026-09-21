@@ -1,0 +1,65 @@
+{
+  "schema_version": "medjepa_v7_config_0.1",
+  "run": {
+    "name": "mg_v7_hologic_lorad_50ep_test_v4",
+    "description": "v7 refactor of v6: Hologic/Lorad LeJEPA with author-style DDP per-view SIGReg; removed positive pairs, batch construction, SupCon, online analysis.",
+    "output_dir": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/luis/runs/mg_v7_hologic_lorad_50ep_test_v4",
+    "seed": 42,
+    "save_resolved_config": true
+  },
+  "paths": {
+    "full_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/mg-only-all.csv",
+    "bin": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/mg-only-all.bin",
+    "train_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_train.csv",
+    "val_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_val.csv",
+    "test_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_test.csv",
+    "augmentation_config": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/luis/config/mg_lejepa_aug_v4.json"
+  },
+  "model": {
+    "backbone_name": "vit_small_patch16_224",
+    "image_size": 224,
+    "backbone_num_classes": 0,
+    "backbone_output_dim": 384,
+    "projection_dim": 16,
+    "projector_hidden_dim": 2048,
+    "drop_path_rate": 0.1,
+    "image_height": 512,
+    "image_width": 512,
+    "memmap_dtype": "uint16",
+    "normalize_mode": "uint16",
+    "percentile_low": 1.0,
+    "percentile_high": 99.0
+  },
+  "training": {
+    "epochs": 50,
+    "batch_size": 128,
+    "num_views": 4,
+    "num_workers": 4,
+    "grad_accum_steps": 1
+  },
+  "optimizer": {
+    "learning_rate": 0.0001,
+    "weight_decay": 0.05,
+    "warmup_epochs": 10,
+    "min_learning_rate": 1e-05,
+    "grad_clip_norm": 0.0
+  },
+  "loss": {
+    "lambda_sigreg": 0.0125,
+    "sigreg_knots": 17,
+    "sigreg_num_projections": 1024,
+    "sigreg_mode": "author_ddp_pooled_views",
+    "sigreg_normalize_by_n": false,
+    "projection_normalization": "sqrt_dim"
+  },
+  "distributed": {
+    "no_cuda_timing_sync": true
+  },
+  "checkpointing": {
+    "checkpoint_every_epochs": 50,
+    "resume_checkpoint": null
+  },
+  "diagnostics": {
+    "diagnostic_every_batches": 50
+  }
+}

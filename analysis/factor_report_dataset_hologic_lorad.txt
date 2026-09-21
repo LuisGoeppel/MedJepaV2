@@ -1,0 +1,55 @@
+MG collapsed BI-RADS factor-only baseline report
+============================================================
+
+Interpretation:
+  no_info_constant_routine: predicts routine for every image. Balanced accuracy is the 3-class no-information baseline.
+  group_majority_factor_only: predicts the most common BI-RADS class within each factor value.
+  balanced_optimal_factor_only: best possible deterministic classifier for balanced accuracy using only that factor.
+
+------------------------------------------------------------
+Factor: view
+N: 221332
+Levels used: 2 / original 2
+Unknown fraction: 0.0000
+Class counts: {'routine': 209221, 'follow_up': 8658, 'biopsy': 3453}
+Mutual information: 0.000099 bits
+Cramer's V: 0.011716
+
+No-info BA:             0.3333 | acc=0.9453 | macro_f1=0.3240
+Group-majority BA:      0.3333 | delta=+0.0000 | acc=0.9453 | macro_f1=0.3240
+Balanced-optimal BA:    0.3457 | delta=+0.0124 | acc=0.5111 | macro_f1=0.2381
+
+Balanced-optimal mapping: {'CC': 'biopsy', 'MLO': 'routine'}
+Group-majority mapping:   {'CC': 'routine', 'MLO': 'routine'}
+
+------------------------------------------------------------
+Factor: machine
+N: 221332
+Levels used: 2 / original 2
+Unknown fraction: 0.0000
+Class counts: {'routine': 209221, 'follow_up': 8658, 'biopsy': 3453}
+Mutual information: 0.000124 bits
+Cramer's V: 0.011977
+
+No-info BA:             0.3333 | acc=0.9453 | macro_f1=0.3240
+Group-majority BA:      0.3333 | delta=+0.0000 | acc=0.9453 | macro_f1=0.3240
+Balanced-optimal BA:    0.3394 | delta=+0.0061 | acc=0.0512 | macro_f1=0.0348
+
+Balanced-optimal mapping: {'HOLOGIC, Inc. Lorad Selenia': 'routine', 'HOLOGIC, Inc. Selenia Dimensions': 'biopsy'}
+Group-majority mapping:   {'HOLOGIC, Inc. Lorad Selenia': 'routine', 'HOLOGIC, Inc. Selenia Dimensions': 'routine'}
+
+------------------------------------------------------------
+Factor: laterality
+N: 221332
+Levels used: 2 / original 2
+Unknown fraction: 0.0000
+Class counts: {'routine': 209221, 'follow_up': 8658, 'biopsy': 3453}
+Mutual information: 0.000043 bits
+Cramer's V: 0.007706
+
+No-info BA:             0.3333 | acc=0.9453 | macro_f1=0.3240
+Group-majority BA:      0.3333 | delta=+0.0000 | acc=0.9453 | macro_f1=0.3240
+Balanced-optimal BA:    0.3443 | delta=+0.0110 | acc=0.0282 | macro_f1=0.0354
+
+Balanced-optimal mapping: {'left': 'biopsy', 'right': 'follow_up'}
+Group-majority mapping:   {'left': 'routine', 'right': 'routine'}

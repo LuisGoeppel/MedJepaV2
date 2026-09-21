@@ -1,0 +1,85 @@
+{
+  "schema_version": "medjepa_v6_config_0.1",
+  "run": {
+    "name": "mg_v6_hologic_lorad_sigreg_perview",
+    "description": "v6 Hologic/Lorad-only embed MG run with only SIGReg patched to LeJEPA-like per-view batch regularization; optional v6 mechanisms disabled.",
+    "output_dir": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/luis/runs/mg_v6_hologic_lorad_sigreg_perview",
+    "seed": 42,
+    "save_resolved_config": true
+  },
+  "paths": {
+    "full_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/mg-only-all.csv",
+    "bin": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/mg-only-all.bin",
+    "train_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_train.csv",
+    "val_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_val.csv",
+    "test_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_test.csv",
+    "augmentation_config": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/luis/config/mg_lejepa_aug_v4.json"
+  },
+  "model": {
+    "backbone_name": "vit_small_patch8_224",
+    "image_size": 224,
+    "backbone_output_dim": 512,
+    "projection_dim": 16,
+    "projector_hidden_dim": 2048,
+    "drop_path_rate": 0.1
+  },
+  "training": {
+    "epochs": 300,
+    "batch_size": 128,
+    "num_views": 4,
+    "num_workers": 4,
+    "grad_accum_steps": 1
+  },
+  "optimizer": {
+    "learning_rate": 0.0001,
+    "weight_decay": 0.05,
+    "warmup_epochs": 10
+  },
+  "loss": {
+    "lambda_sigreg": 0.05,
+    "sigreg_knots": 17,
+    "sigreg_num_projections": 256,
+    "projection_normalization": "sqrt_dim"
+  },
+  "batch_construction": {
+    "enabled": false,
+    "mode": "weighted_infinite",
+    "iterations_per_epoch": 1378,
+    "balance_keys": [
+      "collapsed_birads"
+    ],
+    "balance_strength": 0.0,
+    "dry_run_iterations": 10000
+  },
+  "positive_pairs": {
+    "enabled": true,
+    "probability": 0.25,
+    "require_same_patient": true,
+    "require_same_exam": true,
+    "require_same_laterality": true,
+    "require_different_view": true
+  },
+  "supervised_contrastive": {
+    "enabled": false,
+    "target": "collapsed_birads",
+    "mode": "alternating",
+    "weight": 1.0,
+    "temperature": 0.1,
+    "lejepa_epochs": 20,
+    "contrastive_epochs": 1
+  },
+  "distributed": {
+    "multi_gpu": "ddp",
+    "sync_batchnorm": false,
+    "no_cuda_timing_sync": true
+  },
+  "checkpointing": {
+    "checkpoint_every_epochs": 50,
+    "resume_checkpoint": null,
+    "resume_weights_only": false
+  },
+  "diagnostics": {
+    "diagnostic_every_batches": 50,
+    "write_training_history_every_epoch": true
+  }
+}

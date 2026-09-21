@@ -1,0 +1,71 @@
+MG collapsed BI-RADS factor-only baseline report
+============================================================
+
+Interpretation:
+  no_info_constant_routine: predicts routine for every image. Balanced accuracy is the 3-class no-information baseline.
+  group_majority_factor_only: predicts the most common BI-RADS class within each factor value.
+  balanced_optimal_factor_only: best possible deterministic classifier for balanced accuracy using only that factor.
+
+------------------------------------------------------------
+Factor: dataset
+N: 264481
+Levels used: 6 / original 6
+Unknown fraction: 0.0000
+Class counts: {'routine': 247748, 'follow_up': 9971, 'biopsy': 6762}
+Mutual information: 0.065635 bits
+Cramer's V: 0.400017
+
+No-info BA:             0.3333 | acc=0.9367 | macro_f1=0.3224
+Group-majority BA:      0.4784 | delta=+0.1451 | acc=0.9460 | macro_f1=0.5035
+Balanced-optimal BA:    0.4845 | delta=+0.1512 | acc=0.9454 | macro_f1=0.5041
+
+Balanced-optimal mapping: {'breast-micro-calc': 'biopsy', 'cbis-ddsm': 'biopsy', 'embed': 'routine', 'inbreast': 'biopsy', 'rsna-bcd': 'routine', 'tompei-cmmd': 'biopsy'}
+Group-majority mapping:   {'breast-micro-calc': 'routine', 'cbis-ddsm': 'biopsy', 'embed': 'routine', 'inbreast': 'routine', 'rsna-bcd': 'routine', 'tompei-cmmd': 'biopsy'}
+
+------------------------------------------------------------
+Factor: machine_family
+N: 264481
+Levels used: 4 / original 4
+Unknown fraction: 0.0698
+Class counts: {'routine': 247748, 'follow_up': 9971, 'biopsy': 6762}
+Mutual information: 0.045932 bits
+Cramer's V: 0.337747
+
+No-info BA:             0.3333 | acc=0.9367 | macro_f1=0.3224
+Group-majority BA:      0.4371 | delta=+0.1037 | acc=0.9432 | macro_f1=0.4688
+Balanced-optimal BA:    0.4707 | delta=+0.1374 | acc=0.1140 | macro_f1=0.1382
+
+Balanced-optimal mapping: {'GE/Senographe': 'biopsy', 'Hologic/Lorad': 'follow_up', 'Howtek/Lumysis': 'biopsy', 'unknown': 'routine'}
+Group-majority mapping:   {'GE/Senographe': 'routine', 'Hologic/Lorad': 'routine', 'Howtek/Lumysis': 'biopsy', 'unknown': 'routine'}
+
+------------------------------------------------------------
+Factor: view
+N: 264481
+Levels used: 2 / original 2
+Unknown fraction: 0.0000
+Class counts: {'routine': 247748, 'follow_up': 9971, 'biopsy': 6762}
+Mutual information: 0.000082 bits
+Cramer's V: 0.010653
+
+No-info BA:             0.3333 | acc=0.9367 | macro_f1=0.3224
+Group-majority BA:      0.3333 | delta=+0.0000 | acc=0.9367 | macro_f1=0.3224
+Balanced-optimal BA:    0.3416 | delta=+0.0083 | acc=0.5098 | macro_f1=0.2430
+
+Balanced-optimal mapping: {'CC': 'biopsy', 'MLO': 'routine'}
+Group-majority mapping:   {'CC': 'routine', 'MLO': 'routine'}
+
+------------------------------------------------------------
+Factor: laterality
+N: 264481
+Levels used: 2 / original 2
+Unknown fraction: 0.0000
+Class counts: {'routine': 247748, 'follow_up': 9971, 'biopsy': 6762}
+Mutual information: 0.000049 bits
+Cramer's V: 0.008220
+
+No-info BA:             0.3333 | acc=0.9367 | macro_f1=0.3224
+Group-majority BA:      0.3333 | delta=+0.0000 | acc=0.9367 | macro_f1=0.3224
+Balanced-optimal BA:    0.3441 | delta=+0.0108 | acc=0.0326 | macro_f1=0.0408
+
+Balanced-optimal mapping: {'left': 'biopsy', 'right': 'follow_up'}
+Group-majority mapping:   {'left': 'routine', 'right': 'routine'}

@@ -1,0 +1,136 @@
+{
+  "name": "mg_lejepa_aug_v4_advanced",
+  "description": "Advanced mammography augmentation policy for MedJEPA/LeJEPA.",
+  "version": 3,
+  "seed": 42,
+  "image": {
+    "input_shape": [512, 512],
+    "input_dtype": "uint16",
+    "channels": 1,
+    "normalize": {
+      "method": "uint16_to_0_1",
+      "clip_min": 0.0,
+      "clip_max": 1.0
+    },
+    "output_size": 224
+  },
+  "multi_view": {
+    "num_views": 4
+  },
+  "preprocessing": {
+    "top_right_corner_mask": {
+      "enabled": true,
+      "frac_x": 0.3,
+      "frac_y": 0.2,
+      "value": 0.0,
+      "foreground_threshold": 0.0001
+    },
+    "foreground_crop": {
+      "enabled": true,
+      "threshold_abs": 0.001,
+      "margin_frac": 0.15,
+      "min_foreground_area_frac": 0.02,
+      "fallback_to_original": true
+    },
+    "resize_after_foreground_crop": {
+      "enabled": true,
+      "size": 448,
+      "comment": "Intermediate resize before final random crop."
+    }
+  },
+  "spatial": {
+    "random_resized_crop": {
+      "enabled": true,
+      "size": 224,
+      "scale": [0.8, 1.0],
+      "ratio": [0.85, 1.15]
+    },
+    "horizontal_flip": {
+      "enabled": true,
+      "p": 0.5
+    },
+    "vertical_flip": {
+      "enabled": true,
+      "p": 0.2
+    },
+    "random_affine": {
+      "enabled": true,
+      "p": 0.75,
+      "degrees": 6.0,
+      "translate": [0.025, 0.025],
+      "scale": [0.97, 1.03],
+      "shear": [0.0, 0.0],
+      "fill": 0.0
+    },
+    "large_rotation_90_180": {
+      "enabled": false
+    },
+    "shear_strong": {
+      "enabled": false
+    }
+  },
+  "intensity": {
+    "random_gamma": {
+      "enabled": true,
+      "p": 0.85,
+      "gamma": [0.7, 1.3]
+    },
+    "brightness_contrast": {
+      "enabled": true,
+      "p": 0.85,
+      "brightness": [0.85, 1.15],
+      "contrast": [0.8, 1.2]
+    },
+    "gaussian_noise": {
+      "enabled": true,
+      "p": 0.2,
+      "std": [0.0, 0.003],
+      "clip": true
+    },
+    "gaussian_blur": {
+      "enabled": true,
+      "p": 0.1,
+      "kernel_size": 3,
+      "sigma": [0.1, 0.3]
+    },
+    "sharpen": {
+      "enabled": true,
+      "p": 0.5,
+      "sharpness_factor": [1.0, 1.15]
+    },
+    "histogram_equalization": {
+      "enabled": true,
+      "p": 0.3
+    },
+    "clahe": {
+      "enabled": true,
+      "p": 0.25,
+      "clip_limit": 1.5,
+      "tile_grid_size": [8, 8]
+    },
+    "intensity_inversion": {
+      "enabled": true,
+      "p": 0.15
+    },
+    "solarization": {
+      "enabled": false
+    },
+    "posterization": {
+      "enabled": true,
+      "p": 0.15,
+      "bits": 12
+    }
+  },
+  "occlusion": {
+    "random_erasing": {
+      "enabled": false,
+      "p": 0.0,
+      "scale": [0.01, 0.03],
+      "ratio": [0.3, 3.3],
+      "value": 0.0
+    },
+    "cutout": {
+      "enabled": false
+    }
+  }
+}
