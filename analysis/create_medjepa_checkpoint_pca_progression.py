@@ -23,24 +23,38 @@ This script is compatible with the v5/v5_modified training checkpoints that use:
 """
 
 from __future__ import annotations
+from core.config import deep_get
+from core.models import ViTEncoder, model_hints
+from core.data import (
+    read_csv_clean,
+    prepare_labels,
+    EvalDataset as MedJEPAPCADataset,
+    collate_batch,
+    validate_bin,
+    ensure_original_index as validate_original_index,
+)
+from core.transforms import ConfigurableMGAugmentation
+from core.features import extract_embedding_batches
+from core.pca import make_label_series
+
 
 import argparse
+import hashlib
 import json
 import math
-import os
 import random
 import re
 import warnings
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
@@ -49,21 +63,13 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
-from torch.amp import autocast
-from torch.utils.data import DataLoader, Dataset
-from torchvision.transforms import InterpolationMode
-import torchvision.transforms.functional as TF
-from tqdm.auto import tqdm
-
-try:
-    import timm
-except ImportError as exc:
-    raise ImportError("Missing dependency: timm. Install with: pip install timm") from exc
+from torch.utils.data import DataLoader
 
 
 # -----------------------------
 # Config / model compatibility
 # -----------------------------
+
 
 @dataclass
 class ModelConfig:
@@ -73,52 +79,12 @@ class ModelConfig:
     projection_dim: int = 16
     projector_hidden_dim: int = 2048
     drop_path_rate: float = 0.1
-
-
-class ViTEncoder(nn.Module):
-    """Model wrapper compatible with MedJEPA v5/v5_modified checkpoints."""
-
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        self.backbone = timm.create_model(
-            cfg.backbone_name,
-            pretrained=False,
-            num_classes=cfg.backbone_output_dim,
-            drop_path_rate=cfg.drop_path_rate,
-            img_size=cfg.image_size,
-            in_chans=1,
-        )
-        self.proj = nn.Sequential(
-            nn.Linear(cfg.backbone_output_dim, cfg.projector_hidden_dim),
-            nn.BatchNorm1d(cfg.projector_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(cfg.projector_hidden_dim, cfg.projector_hidden_dim),
-            nn.BatchNorm1d(cfg.projector_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(cfg.projector_hidden_dim, cfg.projection_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # x: [B,V,1,H,W]
-        b, v = x.shape[:2]
-        flat = x.flatten(0, 1)
-        emb = self.backbone(flat)
-        proj = self.proj(emb).reshape(b, v, -1)
-        return emb, proj
-
-
-def deep_get(dct: dict[str, Any], keys: list[str], default: Any) -> Any:
-    cur: Any = dct
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
+    backbone_num_classes: int = 512
 
 
 def strip_prefix_if_present(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
     if state_dict and all(k.startswith(prefix) for k in state_dict.keys()):
-        return {k[len(prefix):]: v for k, v in state_dict.items()}
+        return {k[len(prefix) :]: v for k, v in state_dict.items()}
     return state_dict
 
 
@@ -142,7 +108,11 @@ def load_checkpoint_payload(path: Path) -> tuple[dict[str, torch.Tensor], dict[s
         if state_dict_obj is None:
             raise ValueError(f"Could not find a state dict in checkpoint: {path}")
         cfg_dict = checkpoint.get("config", {}) if isinstance(checkpoint.get("config", {}), dict) else {}
-        aug_cfg = checkpoint.get("augmentation_config", {}) if isinstance(checkpoint.get("augmentation_config", {}), dict) else {}
+        aug_cfg = (
+            checkpoint.get("augmentation_config", {})
+            if isinstance(checkpoint.get("augmentation_config", {}), dict)
+            else {}
+        )
         return normalize_state_dict_keys(state_dict_obj), cfg_dict, aug_cfg
     raise ValueError(f"Unsupported checkpoint format: {path}")
 
@@ -150,58 +120,6 @@ def load_checkpoint_payload(path: Path) -> tuple[dict[str, torch.Tensor], dict[s
 # -----------------------------
 # CSV / labels / metadata
 # -----------------------------
-
-def normalize_birads_value(x: Any) -> float:
-    if pd.isna(x):
-        return np.nan
-    s = str(x).strip().lower()
-    for k in ["1", "2", "3", "4", "5"]:
-        if s == k or s.startswith(k + ".") or s.startswith(k + " ") or f"({k})" in s:
-            return int(k)
-    try:
-        return int(float(s))
-    except Exception:
-        return np.nan
-
-
-def collapse_birads_numeric(x: float) -> str:
-    if pd.isna(x):
-        return "unknown"
-    x = int(x)
-    if x in (1, 2):
-        return "routine"
-    if x == 3:
-        return "follow_up"
-    if x in (4, 5):
-        return "biopsy"
-    return "unknown"
-
-
-def read_csv_clean(path: str | Path) -> pd.DataFrame:
-    df = pd.read_csv(path, low_memory=False)
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
-
-def prepare_labels(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    if "collapsed_birads" in df.columns:
-        df["collapsed_birads"] = df["collapsed_birads"].fillna("unknown").astype(str)
-        if "birads_numeric" not in df.columns:
-            label_col = "original_birads" if "original_birads" in df.columns else "birads" if "birads" in df.columns else None
-            if label_col is not None:
-                df["birads_numeric"] = df[label_col].apply(normalize_birads_value)
-        df = df[df["collapsed_birads"].isin(["routine", "follow_up", "biopsy"])].copy()
-    else:
-        label_col = "original_birads" if "original_birads" in df.columns else "birads" if "birads" in df.columns else None
-        if label_col is None:
-            raise ValueError("CSV must contain collapsed_birads, original_birads, or birads.")
-        df["birads_numeric"] = df[label_col].apply(normalize_birads_value)
-        df = df[df["birads_numeric"].isin([1, 2, 3, 4, 5])].copy()
-        df["birads_numeric"] = df["birads_numeric"].astype(int)
-        df["collapsed_birads"] = df["birads_numeric"].apply(collapse_birads_numeric)
-    df["target_collapsed"] = df["collapsed_birads"].map({"routine": 0, "follow_up": 1, "biopsy": 2}).astype(int)
-    return df
 
 
 def _canonical_key_value(x: Any) -> str:
@@ -230,17 +148,38 @@ def _choose_matching_columns(split_df: pd.DataFrame, full_df_raw: pd.DataFrame) 
     memmap row index.
     """
     excluded = {
-        "original_index", "orig_index", "row_index", "memmap_index", "index", "Unnamed: 0",
-        "split", "target", "target_collapsed", "machine_family", "view", "view_laterality",
+        "original_index",
+        "orig_index",
+        "row_index",
+        "memmap_index",
+        "index",
+        "Unnamed: 0",
+        "split",
+        "target",
+        "target_collapsed",
+        "machine_family",
+        "view",
+        "view_laterality",
         "laterality",  # derived in this script for some datasets
     }
     common = [c for c in split_df.columns if c in full_df_raw.columns and c not in excluded]
 
     # Prefer stable identifying/original columns first, then append remaining common columns.
     preferred = [
-        "id", "patient", "dataset", "modality", "machine", "exam",
-        "birads", "original_birads", "birads_numeric", "collapsed_birads",
-        "race", "segmentation", "context", "findings",
+        "id",
+        "patient",
+        "dataset",
+        "modality",
+        "machine",
+        "exam",
+        "birads",
+        "original_birads",
+        "birads_numeric",
+        "collapsed_birads",
+        "race",
+        "segmentation",
+        "context",
+        "findings",
     ]
     ordered: list[str] = []
     for c in preferred:
@@ -305,42 +244,43 @@ def _map_split_rows_by_composite_key(split_df: pd.DataFrame, full_df_raw: pd.Dat
             "Please add original_index to the split CSV or provide split files generated from the same full CSV."
         )
 
-    print(f"Mapped {split_name} split to memmap rows using composite key: {', '.join(key_cols[:10])}"
-          f"{'...' if len(key_cols) > 10 else ''}")
+    print(
+        f"Mapped {split_name} split to memmap rows using composite key: {', '.join(key_cols[:10])}"
+        f"{'...' if len(key_cols) > 10 else ''}"
+    )
     return mapped.astype(int)
 
 
 def ensure_original_index(split_df: pd.DataFrame, full_df_raw: pd.DataFrame, split_name: str) -> pd.DataFrame:
     split_df = split_df.copy()
     if "original_index" in split_df.columns:
-        split_df["original_index"] = split_df["original_index"].astype(int)
-        return split_df
+        return validate_original_index(split_df, full_df_raw, split_name)
     for candidate in ["orig_index", "row_index", "memmap_index", "Unnamed: 0", "index"]:
         if candidate in split_df.columns:
             vals = pd.to_numeric(split_df[candidate], errors="coerce")
             if vals.notna().all() and vals.min() >= 0 and vals.max() < len(full_df_raw):
-                split_df["original_index"] = vals.astype(int)
-                return split_df
+                split_df["original_index"] = vals
+                return validate_original_index(split_df, full_df_raw, split_name)
 
-    if "id" in split_df.columns and "id" in full_df_raw.columns and not full_df_raw["id"].astype(str).duplicated().any():
+    if (
+        "id" in split_df.columns
+        and "id" in full_df_raw.columns
+        and not full_df_raw["id"].astype(str).duplicated().any()
+    ):
         id_to_idx = pd.Series(np.arange(len(full_df_raw)), index=full_df_raw["id"].astype(str)).to_dict()
         split_df["original_index"] = split_df["id"].astype(str).map(id_to_idx)
         missing = int(split_df["original_index"].isna().sum())
         if missing:
             raise ValueError(f"Could not map {missing} rows in {split_name} split by id.")
-        split_df["original_index"] = split_df["original_index"].astype(int)
-        return split_df
+        return validate_original_index(split_df, full_df_raw, split_name)
 
     # Full CSV has duplicated IDs or ID is unavailable: recover indices from a richer composite key.
     split_df["original_index"] = _map_split_rows_by_composite_key(split_df, full_df_raw, split_name)
-    return split_df
+    return validate_original_index(split_df, full_df_raw, split_name)
 
 
 def build_eval_dataframe(args: argparse.Namespace) -> tuple[pd.DataFrame, int]:
     full_raw = read_csv_clean(args.full_csv)
-    full_df = prepare_labels(full_raw)
-    if "original_index" not in full_df.columns:
-        full_df = full_df.reset_index(drop=False).rename(columns={"index": "original_index"})
 
     split_paths = {"train": args.train_csv, "val": args.val_csv, "test": args.test_csv}
     selected = ["train", "val", "test"] if args.split == "all" else [args.split]
@@ -466,34 +406,12 @@ def add_derived_metadata(df: pd.DataFrame) -> pd.DataFrame:
 # Deterministic eval transform / dataset
 # -----------------------------
 
-class EvalMammographyTransform(nn.Module):
-    def __init__(self, aug_cfg: dict[str, Any], image_size: int):
-        super().__init__()
-        self.cfg = aug_cfg
-        self.image_size = image_size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self._foreground_crop(x)
-        x = self._mask_top_corner(x)
-        x = TF.resize(x, [self.image_size, self.image_size], interpolation=InterpolationMode.BILINEAR, antialias=True)
-        return x.clamp(0, 1)
+class EvalMammographyTransform(ConfigurableMGAugmentation):
+    """Historical progression masking policy; crop/resize are shared."""
 
-    def _foreground_crop(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["preprocessing", "foreground_crop"], {})
-        if not c.get("enabled", False):
-            return x
-        threshold = float(c.get("threshold_abs", 1e-6))
-        margin_frac = float(c.get("margin_frac", 0.05))
-        min_area_frac = float(c.get("min_foreground_area_frac", 0.01))
-        mask = x[0] > threshold
-        ys, xs = torch.where(mask)
-        h, w = x.shape[-2:]
-        if len(xs) < int(h * w * min_area_frac):
-            return x
-        y0, y1 = int(ys.min()), int(ys.max()) + 1
-        x0, x1 = int(xs.min()), int(xs.max()) + 1
-        mh, mw = int((y1 - y0) * margin_frac), int((x1 - x0) * margin_frac)
-        return x[:, max(0, y0 - mh):min(h, y1 + mh), max(0, x0 - mw):min(w, x1 + mw)]
+    def __init__(self, aug_cfg, image_size):
+        super().__init__(aug_cfg, image_size, train=False)
 
     def _mask_top_corner(self, x: torch.Tensor) -> torch.Tensor:
         # Mirrors the optional watermark/top-corner masking used by v4/v5 configs when enabled.
@@ -513,60 +431,14 @@ class EvalMammographyTransform(nn.Module):
         if side in {"left", "both"}:
             x[:, :mh, :mw] = value
         if side in {"right", "both"}:
-            x[:, :mh, w - mw:] = value
+            x[:, :mh, w - mw :] = value
         return x
-
-
-class MedJEPAPCADataset(Dataset):
-    def __init__(self, df: pd.DataFrame, bin_path: str | Path, full_num_rows: int,
-                 image_shape: tuple[int, int], dtype: str, transform: nn.Module,
-                 normalize_mode: str = "uint16", percentile_low: float = 1.0, percentile_high: float = 99.0):
-        self.df = df.reset_index(drop=True)
-        self.bin_path = Path(bin_path)
-        self.full_num_rows = full_num_rows
-        self.image_shape = image_shape
-        self.dtype = np.dtype(dtype)
-        self.transform = transform
-        self.normalize_mode = normalize_mode
-        self.percentile_low = percentile_low
-        self.percentile_high = percentile_high
-        self._imgs: Optional[np.memmap] = None
-
-    def __len__(self) -> int:
-        return len(self.df)
-
-    def _open(self) -> np.memmap:
-        if self._imgs is None:
-            self._imgs = np.memmap(self.bin_path, dtype=self.dtype, mode="r", shape=(self.full_num_rows, *self.image_shape))
-        return self._imgs
-
-    def _load_tensor(self, original_index: int) -> torch.Tensor:
-        arr = self._open()[original_index].astype(np.float32)
-        if self.normalize_mode == "uint16":
-            arr = arr / 65535.0 if self.dtype == np.dtype("uint16") else arr / max(float(arr.max()), 1.0)
-        elif self.normalize_mode == "per_image_percentile":
-            lo, hi = np.percentile(arr, [self.percentile_low, self.percentile_high])
-            arr = np.zeros_like(arr, dtype=np.float32) if hi <= lo else np.clip((arr - lo) / (hi - lo), 0, 1)
-        else:
-            raise ValueError(f"Unknown normalize_mode: {self.normalize_mode}")
-        return torch.from_numpy(arr).unsqueeze(0).float().clamp(0, 1)
-
-    def __getitem__(self, idx: int):
-        row = self.df.iloc[idx]
-        x = self._load_tensor(int(row["original_index"]))
-        x = self.transform(x).unsqueeze(0)  # [V=1,1,H,W]
-        return x, idx
-
-
-def collate_batch(batch):
-    views = torch.stack([b[0] for b in batch])
-    indices = torch.tensor([b[1] for b in batch], dtype=torch.long)
-    return views, indices
 
 
 # -----------------------------
 # Checkpoint discovery / sampling / feature extraction
 # -----------------------------
+
 
 def checkpoint_epoch(path: Path) -> Optional[int]:
     m = re.search(r"checkpoint_epoch_(\d+)\.pt$", path.name)
@@ -577,7 +449,10 @@ def find_checkpoints(args: argparse.Namespace) -> list[tuple[str, Path]]:
     models_dir = Path(args.models_dir)
     if not models_dir.exists():
         raise FileNotFoundError(models_dir)
-    ckpts = sorted(models_dir.glob(args.checkpoint_pattern), key=lambda p: checkpoint_epoch(p) if checkpoint_epoch(p) is not None else 10**9)
+    ckpts = sorted(
+        models_dir.glob(args.checkpoint_pattern),
+        key=lambda p: checkpoint_epoch(p) if checkpoint_epoch(p) is not None else 10**9,
+    )
     out: list[tuple[str, Path]] = []
     for p in ckpts:
         ep = checkpoint_epoch(p)
@@ -631,29 +506,45 @@ def sample_dataframe(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame
 
 
 @torch.inference_mode()
-def extract_features_for_checkpoint(label: str, checkpoint_path: Path, df: pd.DataFrame, args: argparse.Namespace,
-                                    aug_cfg: dict[str, Any], device: torch.device, full_num_rows: int,
-                                    model_cfg_hint: Optional[ModelConfig] = None) -> tuple[np.ndarray, ModelConfig]:
+def extract_features_for_checkpoint(
+    label: str,
+    checkpoint_path: Path,
+    df: pd.DataFrame,
+    args: argparse.Namespace,
+    aug_cfg: dict[str, Any],
+    device: torch.device,
+    full_num_rows: int,
+    model_cfg_hint: Optional[ModelConfig] = None,
+) -> tuple[np.ndarray, ModelConfig]:
     state_dict, cfg_dict, ckpt_aug_cfg = load_checkpoint_payload(checkpoint_path)
     if not aug_cfg and ckpt_aug_cfg:
         aug_cfg = ckpt_aug_cfg
     image_size = int(cfg_dict.get("image_size") or deep_get(aug_cfg, ["image", "output_size"], 384))
     model_cfg = ModelConfig(
         image_size=image_size,
-        backbone_name=str(cfg_dict.get("backbone_name", cfg_dict.get("backbone", model_cfg_hint.backbone_name if model_cfg_hint else "vit_small_patch8_224"))),
-        backbone_output_dim=int(cfg_dict.get("backbone_output_dim", model_cfg_hint.backbone_output_dim if model_cfg_hint else 512)),
+        backbone_name=str(
+            cfg_dict.get(
+                "backbone_name",
+                cfg_dict.get("backbone", model_cfg_hint.backbone_name if model_cfg_hint else "vit_small_patch8_224"),
+            )
+        ),
+        backbone_output_dim=int(
+            cfg_dict.get("backbone_output_dim", model_cfg_hint.backbone_output_dim if model_cfg_hint else 512)
+        ),
         projection_dim=int(cfg_dict.get("projection_dim", model_cfg_hint.projection_dim if model_cfg_hint else 16)),
-        projector_hidden_dim=int(cfg_dict.get("projector_hidden_dim", model_cfg_hint.projector_hidden_dim if model_cfg_hint else 2048)),
+        projector_hidden_dim=int(
+            cfg_dict.get("projector_hidden_dim", model_cfg_hint.projector_hidden_dim if model_cfg_hint else 2048)
+        ),
         drop_path_rate=float(cfg_dict.get("drop_path_rate", model_cfg_hint.drop_path_rate if model_cfg_hint else 0.1)),
     )
 
+    hints = model_hints({"model_state_dict": state_dict, "config": cfg_dict})
+    model_cfg.backbone_num_classes = int(hints.get("backbone_num_classes", model_cfg.backbone_output_dim))
+    model_cfg.backbone_output_dim = int(hints.get("backbone_output_dim", model_cfg.backbone_output_dim))
     model = ViTEncoder(model_cfg)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        print(f"WARNING [{label}] missing keys: {missing[:8]}{' ...' if len(missing) > 8 else ''}")
-    if unexpected:
-        print(f"WARNING [{label}] unexpected keys: {unexpected[:8]}{' ...' if len(unexpected) > 8 else ''}")
+    model.load_state_dict(state_dict, strict=True)
     model = model.to(device).eval()
+    validate_bin(args.bin, full_num_rows, args.image_height, args.image_width, args.memmap_dtype)
 
     transform = EvalMammographyTransform(aug_cfg, image_size=image_size)
     ds = MedJEPAPCADataset(
@@ -679,16 +570,8 @@ def extract_features_for_checkpoint(label: str, checkpoint_path: Path, df: pd.Da
         collate_fn=collate_batch,
     )
 
-    feats: list[torch.Tensor] = []
-    use_cuda = device.type == "cuda"
-    amp_dtype = torch.bfloat16 if use_cuda else torch.float32
-    desc = f"Extracting {label}"
-    for views, _ in tqdm(loader, desc=desc):
-        views = views.to(device, non_blocking=True)
-        with autocast(device_type=device.type, dtype=amp_dtype, enabled=use_cuda):
-            emb, _ = model(views)
-        feats.append(emb.float().cpu())
-    features = torch.cat(feats, dim=0).numpy()
+    features, _, _ = extract_embedding_batches(model, loader, device, True, f"Extracting {label}")
+    features = features.numpy()
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -701,19 +584,57 @@ def cache_path_for(args: argparse.Namespace, checkpoint_path: Path, n_rows: int)
     return cache_dir / f"{safe_name}_n{n_rows}_seed{args.seed}.npz"
 
 
-def extract_or_load_features(label: str, checkpoint_path: Path, df: pd.DataFrame, args: argparse.Namespace,
-                             aug_cfg: dict[str, Any], device: torch.device, full_num_rows: int,
-                             model_cfg_hint: Optional[ModelConfig]) -> tuple[np.ndarray, ModelConfig]:
+def extract_or_load_features(
+    label: str,
+    checkpoint_path: Path,
+    df: pd.DataFrame,
+    args: argparse.Namespace,
+    aug_cfg: dict[str, Any],
+    device: torch.device,
+    full_num_rows: int,
+    model_cfg_hint: Optional[ModelConfig],
+) -> tuple[np.ndarray, ModelConfig]:
     cp = cache_path_for(args, checkpoint_path, len(df))
+    signature = None
+    if args.use_cache:
+        files = []
+        for path in (checkpoint_path, Path(args.bin)):
+            stat = path.stat()
+            files.append((str(path.resolve()), stat.st_size, stat.st_mtime_ns))
+        identity = {
+            "version": "shared_core_v1",
+            "files": files,
+            "rows": df["original_index"].tolist(),
+            "full_num_rows": full_num_rows,
+            "augmentation": aug_cfg,
+            "hint": asdict(model_cfg_hint) if model_cfg_hint else None,
+            "preprocessing": {
+                key: getattr(args, key)
+                for key in (
+                    "image_height",
+                    "image_width",
+                    "memmap_dtype",
+                    "normalize_mode",
+                    "percentile_low",
+                    "percentile_high",
+                )
+            },
+        }
+        signature = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     if args.use_cache and cp.exists():
-        data = np.load(cp, allow_pickle=False)
-        print(f"Loaded cached features for {label}: {cp}")
-        cfg = model_cfg_hint or ModelConfig()
-        return data["features"].astype(np.float32), cfg
-    features, cfg = extract_features_for_checkpoint(label, checkpoint_path, df, args, aug_cfg, device, full_num_rows, model_cfg_hint)
+        with np.load(cp, allow_pickle=False) as data:
+            if "signature" in data and str(data["signature"]) == signature:
+                print(f"Loaded cached features for {label}: {cp}")
+                return data["features"].astype(np.float32), ModelConfig(**json.loads(str(data["model_config"])))
+        print(f"Recomputing incompatible feature cache: {cp}")
+    features, cfg = extract_features_for_checkpoint(
+        label, checkpoint_path, df, args, aug_cfg, device, full_num_rows, model_cfg_hint
+    )
     if args.use_cache:
         cp.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(cp, features=features.astype(np.float32))
+        np.savez_compressed(
+            cp, features=features.astype(np.float32), signature=signature, model_config=json.dumps(asdict(cfg))
+        )
         print(f"Cached features for {label}: {cp}")
     return features, cfg
 
@@ -728,17 +649,6 @@ ORDINAL_COLOR_ORDERS: dict[str, list[str]] = {
     "collapsed_birads": ["routine", "follow_up", "biopsy"],
     "birads_numeric": ["1", "2", "3", "4", "5"],
 }
-
-
-def make_label_series(df: pd.DataFrame, col: str, max_categories: int) -> pd.Series:
-    if col not in df.columns:
-        raise KeyError(col)
-    s = df[col].fillna("missing").astype(str)
-    vc = s.value_counts(dropna=False)
-    if len(vc) > max_categories:
-        keep = set(vc.index[:max_categories - 1])
-        s = s.where(s.isin(keep), other="Other")
-    return s
 
 
 def colors_for_labels(col: str, labels: pd.Series) -> tuple[list[str], dict[str, Any], bool]:
@@ -807,8 +717,15 @@ def set_same_3d_limits(axes: list[Any], coords: dict[str, np.ndarray], pad_frac:
         ax.set_zlim(mins[2] - spans[2] * pad_frac, maxs[2] + spans[2] * pad_frac)
 
 
-def plot_2d_progression_page(pdf: PdfPages, coords: dict[str, np.ndarray], labels: pd.Series, col: str,
-                             title: str, evr: np.ndarray, args: argparse.Namespace) -> None:
+def plot_2d_progression_page(
+    pdf: PdfPages,
+    coords: dict[str, np.ndarray],
+    labels: pd.Series,
+    col: str,
+    title: str,
+    evr: np.ndarray,
+    args: argparse.Namespace,
+) -> None:
     ckpt_labels = list(coords.keys())
     rows, cols = panel_grid(len(ckpt_labels))
     fig, axes_arr = plt.subplots(rows, cols, figsize=(5.0 * cols, 4.5 * rows), squeeze=False)
@@ -825,11 +742,19 @@ def plot_2d_progression_page(pdf: PdfPages, coords: dict[str, np.ndarray], label
         for cat in cats:
             mask = labels_np == str(cat)
             if mask.any():
-                ax.scatter(z[mask, 0], z[mask, 1], s=args.point_size_2d, alpha=args.alpha_2d,
-                           color=color_map[cat], label=str(cat), linewidths=0, rasterized=True)
+                ax.scatter(
+                    z[mask, 0],
+                    z[mask, 1],
+                    s=args.point_size_2d,
+                    alpha=args.alpha_2d,
+                    color=color_map[cat],
+                    label=str(cat),
+                    linewidths=0,
+                    rasterized=True,
+                )
         ax.set_title(ckpt_label, fontsize=11)
-        ax.set_xlabel(f"PC1 ({evr[0]*100:.1f}%)")
-        ax.set_ylabel(f"PC2 ({evr[1]*100:.1f}%)")
+        ax.set_xlabel(f"PC1 ({evr[0] * 100:.1f}%)")
+        ax.set_ylabel(f"PC2 ({evr[1] * 100:.1f}%)")
         ax.grid(alpha=0.2)
         used_axes.append(ax)
 
@@ -839,8 +764,16 @@ def plot_2d_progression_page(pdf: PdfPages, coords: dict[str, np.ndarray], label
     handles, legend_labels = used_axes[0].get_legend_handles_labels()
     if len(legend_labels) <= args.max_categories:
         legend_title = "ordered scale" if is_ordinal else col
-        fig.legend(handles, legend_labels, title=legend_title, loc="lower center",
-                   ncol=min(len(legend_labels), 6), fontsize=9, title_fontsize=9, frameon=True)
+        fig.legend(
+            handles,
+            legend_labels,
+            title=legend_title,
+            loc="lower center",
+            ncol=min(len(legend_labels), 6),
+            fontsize=9,
+            title_fontsize=9,
+            frameon=True,
+        )
         bottom = 0.10
     else:
         bottom = 0.03
@@ -850,8 +783,15 @@ def plot_2d_progression_page(pdf: PdfPages, coords: dict[str, np.ndarray], label
     plt.close(fig)
 
 
-def plot_3d_progression_page(pdf: PdfPages, coords: dict[str, np.ndarray], labels: pd.Series, col: str,
-                             title: str, evr: np.ndarray, args: argparse.Namespace) -> None:
+def plot_3d_progression_page(
+    pdf: PdfPages,
+    coords: dict[str, np.ndarray],
+    labels: pd.Series,
+    col: str,
+    title: str,
+    evr: np.ndarray,
+    args: argparse.Namespace,
+) -> None:
     ckpt_labels = list(coords.keys())
     rows, cols = panel_grid(len(ckpt_labels))
     fig = plt.figure(figsize=(5.2 * cols, 4.7 * rows))
@@ -866,12 +806,20 @@ def plot_3d_progression_page(pdf: PdfPages, coords: dict[str, np.ndarray], label
         for cat in cats:
             mask = labels_np == str(cat)
             if mask.any():
-                ax.scatter(z[mask, 0], z[mask, 1], z[mask, 2], s=args.point_size_3d,
-                           alpha=args.alpha_3d, color=color_map[cat], label=str(cat), linewidths=0)
+                ax.scatter(
+                    z[mask, 0],
+                    z[mask, 1],
+                    z[mask, 2],
+                    s=args.point_size_3d,
+                    alpha=args.alpha_3d,
+                    color=color_map[cat],
+                    label=str(cat),
+                    linewidths=0,
+                )
         ax.set_title(ckpt_label, fontsize=11)
-        ax.set_xlabel(f"PC1 ({evr[0]*100:.1f}%)")
-        ax.set_ylabel(f"PC2 ({evr[1]*100:.1f}%)")
-        ax.set_zlabel(f"PC3 ({evr[2]*100:.1f}%)")
+        ax.set_xlabel(f"PC1 ({evr[0] * 100:.1f}%)")
+        ax.set_ylabel(f"PC2 ({evr[1] * 100:.1f}%)")
+        ax.set_zlabel(f"PC3 ({evr[2] * 100:.1f}%)")
         ax.view_init(elev=args.view_elev, azim=args.view_azim)
 
     if args.same_axes:
@@ -880,8 +828,16 @@ def plot_3d_progression_page(pdf: PdfPages, coords: dict[str, np.ndarray], label
     handles, legend_labels = axes[0].get_legend_handles_labels()
     if len(legend_labels) <= args.max_categories:
         legend_title = "ordered scale" if is_ordinal else col
-        fig.legend(handles, legend_labels, title=legend_title, loc="lower center",
-                   ncol=min(len(legend_labels), 6), fontsize=9, title_fontsize=9, frameon=True)
+        fig.legend(
+            handles,
+            legend_labels,
+            title=legend_title,
+            loc="lower center",
+            ncol=min(len(legend_labels), 6),
+            fontsize=9,
+            title_fontsize=9,
+            frameon=True,
+        )
         bottom = 0.10
     else:
         bottom = 0.03
@@ -891,9 +847,9 @@ def plot_3d_progression_page(pdf: PdfPages, coords: dict[str, np.ndarray], label
     plt.close(fig)
 
 
-
-
-def compute_local_pca_coordinates(features_by_label: dict[str, np.ndarray], args: argparse.Namespace) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+def compute_local_pca_coordinates(
+    features_by_label: dict[str, np.ndarray], args: argparse.Namespace
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """Fit one independent PCA per checkpoint.
 
     This is a *local representation view*: each checkpoint is centered and rotated into its
@@ -913,8 +869,15 @@ def compute_local_pca_coordinates(features_by_label: dict[str, np.ndarray], args
     return coords, evr_by_label
 
 
-def plot_2d_local_pca_page(pdf: PdfPages, coords: dict[str, np.ndarray], evr_by_label: dict[str, np.ndarray],
-                           labels: pd.Series, col: str, title: str, args: argparse.Namespace) -> None:
+def plot_2d_local_pca_page(
+    pdf: PdfPages,
+    coords: dict[str, np.ndarray],
+    evr_by_label: dict[str, np.ndarray],
+    labels: pd.Series,
+    col: str,
+    title: str,
+    args: argparse.Namespace,
+) -> None:
     ckpt_labels = list(coords.keys())
     rows, cols = panel_grid(len(ckpt_labels))
     fig, axes_arr = plt.subplots(rows, cols, figsize=(5.0 * cols, 4.7 * rows), squeeze=False)
@@ -932,11 +895,19 @@ def plot_2d_local_pca_page(pdf: PdfPages, coords: dict[str, np.ndarray], evr_by_
         for cat in cats:
             mask = labels_np == str(cat)
             if mask.any():
-                ax.scatter(z[mask, 0], z[mask, 1], s=args.point_size_2d, alpha=args.alpha_2d,
-                           color=color_map[cat], label=str(cat), linewidths=0, rasterized=True)
-        ax.set_title(f"{ckpt_label}\nPC1={evr[0]*100:.1f}%, PC2={evr[1]*100:.1f}%", fontsize=10)
-        ax.set_xlabel(f"local PC1 ({evr[0]*100:.1f}%)")
-        ax.set_ylabel(f"local PC2 ({evr[1]*100:.1f}%)")
+                ax.scatter(
+                    z[mask, 0],
+                    z[mask, 1],
+                    s=args.point_size_2d,
+                    alpha=args.alpha_2d,
+                    color=color_map[cat],
+                    label=str(cat),
+                    linewidths=0,
+                    rasterized=True,
+                )
+        ax.set_title(f"{ckpt_label}\nPC1={evr[0] * 100:.1f}%, PC2={evr[1] * 100:.1f}%", fontsize=10)
+        ax.set_xlabel(f"local PC1 ({evr[0] * 100:.1f}%)")
+        ax.set_ylabel(f"local PC2 ({evr[1] * 100:.1f}%)")
         ax.grid(alpha=0.2)
         used_axes.append(ax)
 
@@ -946,8 +917,16 @@ def plot_2d_local_pca_page(pdf: PdfPages, coords: dict[str, np.ndarray], evr_by_
     handles, legend_labels = used_axes[0].get_legend_handles_labels()
     if len(legend_labels) <= args.max_categories:
         legend_title = "ordered scale" if is_ordinal else col
-        fig.legend(handles, legend_labels, title=legend_title, loc="lower center",
-                   ncol=min(len(legend_labels), 6), fontsize=9, title_fontsize=9, frameon=True)
+        fig.legend(
+            handles,
+            legend_labels,
+            title=legend_title,
+            loc="lower center",
+            ncol=min(len(legend_labels), 6),
+            fontsize=9,
+            title_fontsize=9,
+            frameon=True,
+        )
         bottom = 0.11
     else:
         bottom = 0.03
@@ -957,8 +936,15 @@ def plot_2d_local_pca_page(pdf: PdfPages, coords: dict[str, np.ndarray], evr_by_
     plt.close(fig)
 
 
-def plot_3d_local_pca_page(pdf: PdfPages, coords: dict[str, np.ndarray], evr_by_label: dict[str, np.ndarray],
-                           labels: pd.Series, col: str, title: str, args: argparse.Namespace) -> None:
+def plot_3d_local_pca_page(
+    pdf: PdfPages,
+    coords: dict[str, np.ndarray],
+    evr_by_label: dict[str, np.ndarray],
+    labels: pd.Series,
+    col: str,
+    title: str,
+    args: argparse.Namespace,
+) -> None:
     ckpt_labels = list(coords.keys())
     rows, cols = panel_grid(len(ckpt_labels))
     fig = plt.figure(figsize=(5.2 * cols, 4.9 * rows))
@@ -974,12 +960,22 @@ def plot_3d_local_pca_page(pdf: PdfPages, coords: dict[str, np.ndarray], evr_by_
         for cat in cats:
             mask = labels_np == str(cat)
             if mask.any():
-                ax.scatter(z[mask, 0], z[mask, 1], z[mask, 2], s=args.point_size_3d,
-                           alpha=args.alpha_3d, color=color_map[cat], label=str(cat), linewidths=0)
-        ax.set_title(f"{ckpt_label}\nPC1={evr[0]*100:.1f}%, PC2={evr[1]*100:.1f}%, PC3={evr[2]*100:.1f}%", fontsize=9)
-        ax.set_xlabel(f"local PC1")
-        ax.set_ylabel(f"local PC2")
-        ax.set_zlabel(f"local PC3")
+                ax.scatter(
+                    z[mask, 0],
+                    z[mask, 1],
+                    z[mask, 2],
+                    s=args.point_size_3d,
+                    alpha=args.alpha_3d,
+                    color=color_map[cat],
+                    label=str(cat),
+                    linewidths=0,
+                )
+        ax.set_title(
+            f"{ckpt_label}\nPC1={evr[0] * 100:.1f}%, PC2={evr[1] * 100:.1f}%, PC3={evr[2] * 100:.1f}%", fontsize=9
+        )
+        ax.set_xlabel("local PC1")
+        ax.set_ylabel("local PC2")
+        ax.set_zlabel("local PC3")
         ax.view_init(elev=args.view_elev, azim=args.view_azim)
 
     if args.local_same_axes:
@@ -988,8 +984,16 @@ def plot_3d_local_pca_page(pdf: PdfPages, coords: dict[str, np.ndarray], evr_by_
     handles, legend_labels = axes[0].get_legend_handles_labels()
     if len(legend_labels) <= args.max_categories:
         legend_title = "ordered scale" if is_ordinal else col
-        fig.legend(handles, legend_labels, title=legend_title, loc="lower center",
-                   ncol=min(len(legend_labels), 6), fontsize=9, title_fontsize=9, frameon=True)
+        fig.legend(
+            handles,
+            legend_labels,
+            title=legend_title,
+            loc="lower center",
+            ncol=min(len(legend_labels), 6),
+            fontsize=9,
+            title_fontsize=9,
+            frameon=True,
+        )
         bottom = 0.11
     else:
         bottom = 0.03
@@ -998,8 +1002,14 @@ def plot_3d_local_pca_page(pdf: PdfPages, coords: dict[str, np.ndarray], evr_by_
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
-def create_progression_pdf(df: pd.DataFrame, features_by_label: dict[str, np.ndarray], args: argparse.Namespace,
-                           output_pdf: Path, checkpoint_paths: list[tuple[str, Path]]) -> None:
+
+def create_progression_pdf(
+    df: pd.DataFrame,
+    features_by_label: dict[str, np.ndarray],
+    args: argparse.Namespace,
+    output_pdf: Path,
+    checkpoint_paths: list[tuple[str, Path]],
+) -> None:
     labels_for_concat = list(features_by_label.keys())
     concat_features = np.concatenate([features_by_label[k] for k in labels_for_concat], axis=0)
 
@@ -1017,7 +1027,7 @@ def create_progression_pdf(df: pd.DataFrame, features_by_label: dict[str, np.nda
     offset = 0
     n = len(df)
     for label in labels_for_concat:
-        z = concat_z[offset:offset + n]
+        z = concat_z[offset : offset + n]
         coords[label] = z
         offset += n
 
@@ -1035,10 +1045,10 @@ def create_progression_pdf(df: pd.DataFrame, features_by_label: dict[str, np.nda
             f"Sampling: {args.sampling}",
             f"Rows per checkpoint: {len(df):,}",
             f"Feature dimension: {next(iter(features_by_label.values())).shape[1]}",
-            f"PCA fit: shared/global across all checkpoints and sampled images",
+            "PCA fit: shared/global across all checkpoints and sampled images",
             f"Feature standardization before PCA: {args.standardize_features}",
-            f"PCA explained variance: PC1={evr[0]*100:.2f}%, PC2={evr[1]*100:.2f}%, PC3={evr[2]*100:.2f}%",
-            f"Cumulative PC1-PC3: {evr[:3].sum()*100:.2f}%",
+            f"PCA explained variance: PC1={evr[0] * 100:.2f}%, PC2={evr[1] * 100:.2f}%, PC3={evr[2] * 100:.2f}%",
+            f"Cumulative PC1-PC3: {evr[:3].sum() * 100:.2f}%",
             "",
             "Collapsed BI-RADS counts:",
             str(df["collapsed_birads"].value_counts().to_dict()),
@@ -1056,56 +1066,99 @@ def create_progression_pdf(df: pd.DataFrame, features_by_label: dict[str, np.nda
         add_text_page(pdf, lines)
 
         plot_2d_progression_page(
-            pdf, coords, make_label_series(df, "collapsed_birads", args.max_categories), "collapsed_birads",
-            "2D PCA embedding progression colored by collapsed BI-RADS", evr, args,
+            pdf,
+            coords,
+            make_label_series(df, "collapsed_birads", args.max_categories),
+            "collapsed_birads",
+            "2D PCA embedding progression colored by collapsed BI-RADS",
+            evr,
+            args,
         )
         plot_2d_progression_page(
-            pdf, coords, make_label_series(df, "machine_family", args.max_categories), "machine_family",
-            "2D PCA embedding progression colored by machine family", evr, args,
+            pdf,
+            coords,
+            make_label_series(df, "machine_family", args.max_categories),
+            "machine_family",
+            "2D PCA embedding progression colored by machine family",
+            evr,
+            args,
         )
         plot_2d_progression_page(
-            pdf, coords, make_label_series(df, "view", args.max_categories), "view",
-            "2D PCA embedding progression colored by view", evr, args,
+            pdf,
+            coords,
+            make_label_series(df, "view", args.max_categories),
+            "view",
+            "2D PCA embedding progression colored by view",
+            evr,
+            args,
         )
         plot_3d_progression_page(
-            pdf, coords, make_label_series(df, "collapsed_birads", args.max_categories), "collapsed_birads",
-            "3D PCA embedding progression colored by collapsed BI-RADS", evr, args,
+            pdf,
+            coords,
+            make_label_series(df, "collapsed_birads", args.max_categories),
+            "collapsed_birads",
+            "3D PCA embedding progression colored by collapsed BI-RADS",
+            evr,
+            args,
         )
 
         if args.include_local_pca_pages:
             local_coords, local_evr_by_label = compute_local_pca_coordinates(features_by_label, args)
-            add_text_page(pdf, [
-                "Local PCA / local representation view",
-                "====================================",
-                "",
-                "These pages fit PCA separately for each checkpoint.",
-                "Each panel is centered and rotated into that checkpoint's own best PCA basis.",
-                "This removes the global scale-contraction effect and shows the internal structure",
-                "of each checkpoint in its local coordinate system.",
-                "",
-                f"Local panels use same axes across checkpoints: {args.local_same_axes}",
-                f"Feature standardization before each local PCA: {args.standardize_features}",
-                "",
-                "Important: local PCA axes are not directly comparable across epochs;",
-                "they are intended to match the style of a final-only PCA report.",
-                "The epoch-0300 local panel should therefore align with the detailed final PCA",
-                "when the same checkpoint, sample, preprocessing, and random seed are used.",
-            ])
-            plot_2d_local_pca_page(
-                pdf, local_coords, local_evr_by_label, make_label_series(df, "collapsed_birads", args.max_categories), "collapsed_birads",
-                "2D local PCA per checkpoint colored by collapsed BI-RADS", args,
+            add_text_page(
+                pdf,
+                [
+                    "Local PCA / local representation view",
+                    "====================================",
+                    "",
+                    "These pages fit PCA separately for each checkpoint.",
+                    "Each panel is centered and rotated into that checkpoint's own best PCA basis.",
+                    "This removes the global scale-contraction effect and shows the internal structure",
+                    "of each checkpoint in its local coordinate system.",
+                    "",
+                    f"Local panels use same axes across checkpoints: {args.local_same_axes}",
+                    f"Feature standardization before each local PCA: {args.standardize_features}",
+                    "",
+                    "Important: local PCA axes are not directly comparable across epochs;",
+                    "they are intended to match the style of a final-only PCA report.",
+                    "The epoch-0300 local panel should therefore align with the detailed final PCA",
+                    "when the same checkpoint, sample, preprocessing, and random seed are used.",
+                ],
             )
             plot_2d_local_pca_page(
-                pdf, local_coords, local_evr_by_label, make_label_series(df, "machine_family", args.max_categories), "machine_family",
-                "2D local PCA per checkpoint colored by machine family", args,
+                pdf,
+                local_coords,
+                local_evr_by_label,
+                make_label_series(df, "collapsed_birads", args.max_categories),
+                "collapsed_birads",
+                "2D local PCA per checkpoint colored by collapsed BI-RADS",
+                args,
             )
             plot_2d_local_pca_page(
-                pdf, local_coords, local_evr_by_label, make_label_series(df, "view", args.max_categories), "view",
-                "2D local PCA per checkpoint colored by view", args,
+                pdf,
+                local_coords,
+                local_evr_by_label,
+                make_label_series(df, "machine_family", args.max_categories),
+                "machine_family",
+                "2D local PCA per checkpoint colored by machine family",
+                args,
+            )
+            plot_2d_local_pca_page(
+                pdf,
+                local_coords,
+                local_evr_by_label,
+                make_label_series(df, "view", args.max_categories),
+                "view",
+                "2D local PCA per checkpoint colored by view",
+                args,
             )
             plot_3d_local_pca_page(
-                pdf, local_coords, local_evr_by_label, make_label_series(df, "collapsed_birads", args.max_categories), "collapsed_birads",
-                "3D local PCA per checkpoint colored by collapsed BI-RADS", args,
+                pdf,
+                local_coords,
+                local_evr_by_label,
+                make_label_series(df, "collapsed_birads", args.max_categories),
+                "collapsed_birads",
+                "3D local PCA per checkpoint colored by collapsed BI-RADS",
+                args,
             )
 
     print(f"Saved PCA progression PDF to: {output_pdf}")
@@ -1115,14 +1168,25 @@ def create_progression_pdf(df: pd.DataFrame, features_by_label: dict[str, np.nda
 # CLI
 # -----------------------------
 
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Create side-by-side PCA progression PDF across MedJEPA checkpoints.")
-    p.add_argument("--models-dir", required=True, type=str, help="Run models/ directory containing checkpoint_epoch_*.pt files.")
+    p.add_argument(
+        "--models-dir", required=True, type=str, help="Run models/ directory containing checkpoint_epoch_*.pt files."
+    )
     p.add_argument("--checkpoint-pattern", type=str, default="checkpoint_epoch_*.pt")
     p.add_argument("--include-final", action="store_true", help="Also include final_lejepa_checkpoint.pt if present.")
-    p.add_argument("--include-final-duplicate", action="store_true", help="Include final even if checkpoint_epoch_0300.pt is present.")
-    p.add_argument("--final-epoch", type=int, default=300, help="Epoch number used to detect final/checkpoint duplicate.")
-    p.add_argument("--max-checkpoints", type=int, default=0, help="0 = all; otherwise use an approximately uniform subset.")
+    p.add_argument(
+        "--include-final-duplicate",
+        action="store_true",
+        help="Include final even if checkpoint_epoch_0300.pt is present.",
+    )
+    p.add_argument(
+        "--final-epoch", type=int, default=300, help="Epoch number used to detect final/checkpoint duplicate."
+    )
+    p.add_argument(
+        "--max-checkpoints", type=int, default=0, help="0 = all; otherwise use an approximately uniform subset."
+    )
 
     p.add_argument("--full-csv", required=True, type=str)
     p.add_argument("--bin", required=True, type=str)
@@ -1130,7 +1194,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-csv", type=str, default="")
     p.add_argument("--test-csv", type=str, default="")
     p.add_argument("--split", choices=["train", "val", "test", "all"], default="test")
-    p.add_argument("--aug-config", type=str, default="", help="Optional. If omitted, uses checkpoint augmentation_config if available.")
+    p.add_argument(
+        "--aug-config",
+        type=str,
+        default="",
+        help="Optional. If omitted, uses checkpoint augmentation_config if available.",
+    )
     p.add_argument("--output-pdf", required=True, type=str)
 
     p.add_argument("--max-samples", type=int, default=1998)
@@ -1141,7 +1210,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--use-cache", action="store_true", help="Cache extracted features as compressed npz files.")
     p.add_argument("--cache-dir", type=str, default="", help="Optional cache directory. Default: <output_pdf>.cache")
-    p.add_argument("--standardize-features", action="store_true", help="Z-score features across all checkpoints before global PCA.")
+    p.add_argument(
+        "--standardize-features", action="store_true", help="Z-score features across all checkpoints before global PCA."
+    )
 
     p.add_argument("--image-height", type=int, default=512)
     p.add_argument("--image-width", type=int, default=512)
@@ -1150,9 +1221,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--percentile-low", type=float, default=1.0)
     p.add_argument("--percentile-high", type=float, default=99.0)
 
-    p.add_argument("--same-axes", action=argparse.BooleanOptionalAction, default=True, help="Use same axis limits across checkpoint panels for the shared/global PCA pages.")
-    p.add_argument("--include-local-pca-pages", action=argparse.BooleanOptionalAction, default=True, help="Also add local PCA pages where PCA is fitted separately per checkpoint.")
-    p.add_argument("--local-same-axes", action=argparse.BooleanOptionalAction, default=False, help="Use same axis limits across checkpoint panels on the local PCA pages. Default false to show each checkpoint in its own final-report-like view.")
+    p.add_argument(
+        "--same-axes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use same axis limits across checkpoint panels for the shared/global PCA pages.",
+    )
+    p.add_argument(
+        "--include-local-pca-pages",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also add local PCA pages where PCA is fitted separately per checkpoint.",
+    )
+    p.add_argument(
+        "--local-same-axes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use same axis limits across checkpoint panels on the local PCA pages. Default false to show each checkpoint in its own final-report-like view.",
+    )
     p.add_argument("--point-size-2d", type=float, default=8.0)
     p.add_argument("--point-size-3d", type=float, default=5.0)
     p.add_argument("--alpha-2d", type=float, default=0.60)
@@ -1194,7 +1280,9 @@ def main() -> None:
         # Try first checkpoint metadata as fallback.
         _, _, aug_cfg = load_checkpoint_payload(checkpoints[0][1])
     if not aug_cfg:
-        raise ValueError("No augmentation config found. Pass --aug-config or use checkpoints containing augmentation_config.")
+        raise ValueError(
+            "No augmentation config found. Pass --aug-config or use checkpoints containing augmentation_config."
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")

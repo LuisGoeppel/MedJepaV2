@@ -60,6 +60,24 @@ Baseline label policies are separate from LeJEPA's numeric 1–5 policy. Sweeps 
 
 Intentional corrections: predefined splits now reject patient/image overlap, invalid indices and duplicate images; generated splits require patient identifiers rather than falling back to row splitting. Unknown BIN layouts fail instead of guessing 512×512 uint16. Resolution workers select their assigned CUDA device, and directory names include the actual requested training size. GPU numbers are indices within the job's visible CUDA devices. Do not combine `--parallel-gpus` and `--data-parallel`.
 
+## Dataset preparation and additional analysis
+
+These workflows now live in packages and reuse `core/`. Run them from the project folder with their existing arguments:
+
+```bash
+python -m dataset.create_dataset_overview /path/to/mg
+python -m dataset.create_mg_machine_family_split --mode filter_existing --full-csv /data/mg-only-all.csv --train-csv /data/train.csv --val-csv /data/val.csv --test-csv /data/test.csv --output-dir /data/hologic_splits
+python -m analysis.create_medjepa_checkpoint_pca_progression --models-dir /runs/model/models --full-csv /data/mg-only-all.csv --bin /data/mg-only-all.bin --test-csv /data/test.csv --output-pdf /reports/progression.pdf
+python -m analysis.pca_outlier_analysis_v3 --checkpoint /runs/model/models/final_lejepa_checkpoint.pt --output-dir /reports/outliers
+python -m analysis.analyze_mg_factor_birads_baselines --csv /data/test.csv --out-dir /reports/factors
+```
+
+The original basenames are retained; only their folders and invocation change. The existing text reports in `analysis/` are unchanged. Dataset overview reuses label parsing, machine-family inference, BIN layout detection and HTML figure serialization. The split tool reuses naming, metadata summaries and JSON writing, while retaining its proportional split ratios and historical small-group fallback. It now adds physical `original_index` values before filtering the full CSV in `resplit` mode. Missing group identifiers and nonpositive split ratios are rejected.
+
+The PCA tools reuse the shared encoder/projector, memmap reader, numeric-label helpers, index validation and ordered batch extraction. Outlier analysis also uses the shared augmentation implementation. Its outlier algorithms, detailed galleries and reference-checkpoint model reuse remain local. Progression keeps its historical fixed-corner mask and sampling policy; these differ from training's adaptive corner mask and regular PCA sampling. Its checkpoint loads now fail on missing weights, and both PCA tools support headless v7 encoders. Its feature cache verifies checkpoint/BIN identity, selected row order and preprocessing settings; old caches are recomputed. The overview rejects unknown BIN layouts instead of guessing.
+
+Factor analysis retains its own factor-label rules, metadata fallback and factor-only metrics; replacing those with training policies would change its results. It shares CSV/JSON utilities and robust context parsing. Outlier histograms now handle nearly constant scores without failing to construct bins, and full-dataset analysis preserves one unambiguous physical row-index column.
+
 ## Configuration
 
 - `config/mg_v7_hologic_lorad_config.json` keeps the existing v7 training schema. Its `paths.analysis_config` references `analysis.json`, and `paths.augmentation_config` references `mg_lejepa_aug_v4.json`.
@@ -130,14 +148,14 @@ These corrections are intentional and can affect comparisons with old reports:
 
 ## Environment and checks
 
-Upload the entry points, **entire `core/` directory**, **`supervised/` directory** and referenced configurations together. Launch jobs from a fixed snapshot so subsequent uploads do not change queued jobs. No package installation is needed when launching the documented commands from this folder. The distribution name in `pyproject.toml` remains `medjepa`; it includes the `core` and `supervised` Python packages.
+Upload the entry points, **entire `core/`, `supervised/`, `dataset/` and `analysis/` directories** and referenced configurations together. Launch jobs from a fixed snapshot so subsequent uploads do not change queued jobs. No package installation is needed when launching the documented commands from this folder. The distribution name in `pyproject.toml` remains `medjepa`; it includes all four Python packages.
 
 `pyproject.toml` declares dependencies. In a prepared environment, optional editable installation is:
 
 ```bash
 python -m pip install -e ".[test,opencv]"
 python -m pytest -q
-python -m ruff check core supervised tests train_medjepa.py analyze_medjepa.py run_transfer_experiment.py
+python -m ruff check core supervised dataset analysis tests train_medjepa.py analyze_medjepa.py run_transfer_experiment.py
 ```
 
 Keep the cluster's working PyTorch/torchvision/CUDA combination. The local `.venv/` is ignored by Git and uses CPU PyTorch for verification; it should not be uploaded as the cluster environment. OpenCV is required for resizing in the two supervised sweeps. It also affects connected-component corner-mask behavior and CLAHE; use the same OpenCV availability when comparing runs.

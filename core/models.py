@@ -43,15 +43,11 @@ class ViTEncoder(nn.Module):
         self.embedding_dim = actual_dim
         cfg.backbone_output_dim = actual_dim
 
-        self.proj = nn.Sequential(
-            nn.Linear(actual_dim, cfg.projector_hidden_dim),
-            nn.BatchNorm1d(cfg.projector_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(cfg.projector_hidden_dim, cfg.projector_hidden_dim),
-            nn.BatchNorm1d(cfg.projector_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(cfg.projector_hidden_dim, cfg.projection_dim),
-        )
+        self.proj = build_projector(actual_dim, cfg.projector_hidden_dim, cfg.projection_dim)
+
+    def encode_one(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        embedding = self.backbone(x)
+        return embedding, self.proj(embedding)
 
     # Batch-first projection shape is required for correct torch.nn.DataParallel gathering.
     # Shape: [B, V, D]. Older versions returned [V, B, D], which breaks when
@@ -62,6 +58,18 @@ class ViTEncoder(nn.Module):
         emb = self.backbone(flat)
         proj = self.proj(emb).reshape(b, v, -1)
         return emb, proj
+
+
+def build_projector(input_dim: int, hidden_dim: int, output_dim: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(input_dim, hidden_dim),
+        nn.BatchNorm1d(hidden_dim),
+        nn.ReLU(inplace=True),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.BatchNorm1d(hidden_dim),
+        nn.ReLU(inplace=True),
+        nn.Linear(hidden_dim, output_dim),
+    )
 
 
 class ViTBackboneClassifier(nn.Module):

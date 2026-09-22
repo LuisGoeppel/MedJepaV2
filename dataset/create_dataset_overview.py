@@ -9,7 +9,7 @@ Patched version:
   - includes collapsed_birads distributions, crosstables, plots, and image examples.
 
 Usage:
-  python create_mg_dataset_overview_patched.py \
+  python -m dataset.create_dataset_overview \
     /pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg
 
 Outputs, by default:
@@ -23,16 +23,13 @@ It overwrites only the two output report files above, unless --output-html/--out
 from __future__ import annotations
 
 import argparse
-import base64
 import html
-import io
 import json
-import math
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib
 
@@ -40,11 +37,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from core.plotting import figure_to_base64 as plot_to_base64
 
 
 DEFAULT_CSV_NAME = "mg-only-all.csv"
 DEFAULT_BIN_NAME = "mg-only-all.bin"
-CLASS_ORDER = ["routine", "follow_up", "biopsy"]
+from core.data import (
+    CLASS_NAMES as CLASS_ORDER,
+    infer_machine_family as infer_machine_family_from_machine,
+    parse_birads_number,
+    collapse_birads_value,
+    open_memmap,
+    infer_bin_spec as infer_image_layout,
+)
 
 
 @dataclass
@@ -100,22 +105,6 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out.columns = [str(c).strip().lstrip("\ufeff") for c in out.columns]
     return out
-
-
-def infer_machine_family_from_machine(machine: object) -> str:
-    if pd.isna(machine):
-        return "unknown"
-    text = str(machine).lower()
-
-    if any(token in text for token in ["hologic", "lorad", "selenia", "dimensions", "3dimensions"]):
-        return "Hologic/Lorad"
-    if any(token in text for token in ["howtek", "lumisys", "lumysis"]):
-        return "Howtek/Lumysis"
-    if any(token in text for token in ["senographe", "ge healthcare", "general electric"]):
-        return "GE/Senographe"
-    if re.search(r"(^|[^a-z])ge([^a-z]|$)", text):
-        return "GE/Senographe"
-    return "unknown"
 
 
 def normalize_view_value(value: object) -> Optional[str]:
@@ -217,73 +206,6 @@ def infer_laterality_from_row(row: pd.Series) -> str:
     return "unknown"
 
 
-def parse_birads_number(value: object) -> Optional[int]:
-    if pd.isna(value):
-        return None
-
-    text = str(value).strip().lower()
-    if text in {"", "nan", "none", "missing", "unknown"}:
-        return None
-
-    # Prefer explicit original_birads values such as "(4) suspicious".
-    m = re.search(r"\(([0-6])\)", text)
-    if m:
-        return int(m.group(1))
-
-    # Numeric-like values.
-    try:
-        f = float(text)
-        if np.isfinite(f):
-            return int(f)
-    except Exception:
-        pass
-
-    # Fallback for values such as "BI-RADS 4A".
-    m = re.search(r"(^|[^0-9])([0-6])([^0-9]|$)", text)
-    if m:
-        return int(m.group(2))
-
-    return None
-
-
-def collapse_birads_value(value: object) -> Optional[str]:
-    if pd.isna(value):
-        return None
-
-    raw = str(value).strip().lower()
-    if raw in {"", "nan", "none", "missing", "unknown"}:
-        return None
-
-    norm = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
-
-    if norm in {"routine", "follow_up", "biopsy"}:
-        return norm
-
-    # Native actionability strings in mg-only-all.csv:
-    #   healthy/routine
-    #   probably benign (follow up)
-    #   suspicious/malignancy-likely (biopsy)
-    # Order matters: probably benign should be follow_up, not routine.
-    if "biopsy" in raw or "suspicious" in raw or "malignan" in raw:
-        return "biopsy"
-    if "follow" in raw or "probably benign" in raw or "probably_benign" in norm:
-        return "follow_up"
-    if "routine" in raw or "healthy" in raw or "negative" in raw or raw == "benign" or norm == "benign":
-        return "routine"
-
-    n = parse_birads_number(value)
-    if n is None:
-        return None
-    if n in {1, 2}:
-        return "routine"
-    if n in {0, 3}:
-        return "follow_up"
-    if n in {4, 5, 6}:
-        return "biopsy"
-
-    return None
-
-
 def derive_collapsed_birads(df: pd.DataFrame, derived: Dict[str, str], warnings: List[str]) -> pd.DataFrame:
     out = df.copy()
 
@@ -294,7 +216,9 @@ def derive_collapsed_birads(df: pd.DataFrame, derived: Dict[str, str], warnings:
         # Prefer birads because this MG CSV already stores actionability labels there.
         candidate_cols = [c for c in ["birads", "original_birads", "birads_numeric"] if c in out.columns]
         if not candidate_cols:
-            warnings.append("Could not derive collapsed_birads because none of birads/original_birads/birads_numeric exist.")
+            warnings.append(
+                "Could not derive collapsed_birads because none of birads/original_birads/birads_numeric exist."
+            )
             return out
 
         chosen = None
@@ -313,9 +237,7 @@ def derive_collapsed_birads(df: pd.DataFrame, derived: Dict[str, str], warnings:
         derived["collapsed_birads"] = f"derived from {chosen}"
 
         if best_non_missing == 0:
-            warnings.append(
-                "Derived collapsed_birads has zero valid rows. Check birads/original_birads value formats."
-            )
+            warnings.append("Derived collapsed_birads has zero valid rows. Check birads/original_birads value formats.")
 
     invalid = int(out["collapsed_birads"].isna().sum()) if "collapsed_birads" in out.columns else len(out)
     if invalid > 0:
@@ -356,36 +278,18 @@ def enrich_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str], Li
 
 
 def infer_bin_spec(bin_path: Path, n_rows: int) -> BinSpec:
-    actual = int(bin_path.stat().st_size)
-    candidates = [
-        ("uint16", np.dtype("uint16"), 512, 512, 1),
-        ("uint8", np.dtype("uint8"), 512, 512, 1),
-        ("float32", np.dtype("float32"), 512, 512, 1),
-        ("uint16", np.dtype("uint16"), 224, 224, 1),
-        ("uint8", np.dtype("uint8"), 224, 224, 1),
-    ]
-
-    for dtype_name, dtype, h, w, c in candidates:
-        row_bytes = int(h * w * c * dtype.itemsize)
-        expected = int(n_rows * row_bytes)
-        if expected == actual:
-            return BinSpec(dtype_name, h, w, c, row_bytes, expected, actual, True)
-
-    # Fallback for the known MG file.
-    dtype = np.dtype("uint16")
-    h, w, c = 512, 512, 1
-    row_bytes = int(h * w * c * dtype.itemsize)
-    expected = int(n_rows * row_bytes)
-    return BinSpec("uint16", h, w, c, row_bytes, expected, actual, False)
-
-
-def open_memmap(bin_path: Path, spec: BinSpec, n_rows: int) -> np.memmap:
-    dtype = np.dtype(spec.dtype)
-    if spec.channels == 1:
-        shape = (n_rows, spec.height, spec.width)
-    else:
-        shape = (n_rows, spec.height, spec.width, spec.channels)
-    return np.memmap(bin_path, dtype=dtype, mode="r", shape=shape)
+    spec = infer_image_layout(bin_path, n_rows)
+    row_bytes = spec.height * spec.width * spec.channels * np.dtype(spec.dtype).itemsize
+    return BinSpec(
+        spec.dtype,
+        spec.height,
+        spec.width,
+        spec.channels,
+        row_bytes,
+        n_rows * row_bytes,
+        bin_path.stat().st_size,
+        spec.exact_match,
+    )
 
 
 def top_counts(series: pd.Series, n: int = 12, include_missing: bool = True) -> Dict[str, int]:
@@ -444,13 +348,6 @@ def rows_per_group_summary(df: pd.DataFrame, col: str) -> Optional[Dict[str, Any
     }
 
 
-def plot_to_base64(fig: plt.Figure) -> str:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=135, bbox_inches="tight")
-    plt.close(fig)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
-
-
 def make_bar_plot(series: pd.Series, title: str, max_categories: int = 12) -> str:
     counts = series.fillna("missing").astype(str).value_counts().head(max_categories)
     fig_height = max(3.0, 0.42 * len(counts) + 1.5)
@@ -463,7 +360,9 @@ def make_bar_plot(series: pd.Series, title: str, max_categories: int = 12) -> st
     return plot_to_base64(fig)
 
 
-def compute_crosstable(df: pd.DataFrame, row_col: str, col_col: str, max_rows: int = 20, max_cols: int = 20) -> Optional[Dict[str, Any]]:
+def compute_crosstable(
+    df: pd.DataFrame, row_col: str, col_col: str, max_rows: int = 20, max_cols: int = 20
+) -> Optional[Dict[str, Any]]:
     if row_col not in df.columns or col_col not in df.columns:
         return None
 
@@ -489,10 +388,7 @@ def compute_crosstable(df: pd.DataFrame, row_col: str, col_col: str, max_rows: i
     return {
         "rows": row_col,
         "columns": col_col,
-        "counts": {
-            str(idx): {str(col): int(val) for col, val in row.items()}
-            for idx, row in table.iterrows()
-        },
+        "counts": {str(idx): {str(col): int(val) for col, val in row.items()} for idx, row in table.iterrows()},
         "row_percent": {
             str(idx): {str(col): round(float(val), 2) if np.isfinite(val) else 0.0 for col, val in row.items()}
             for idx, row in row_percent.iterrows()
@@ -551,8 +447,8 @@ def crosstable_plots(df: pd.DataFrame, row_col: str, col_col: str) -> Optional[D
     row_pct = counts.div(counts.sum(axis=1).replace(0, np.nan), axis=0) * 100.0
 
     return {
-        "counts_heatmap": make_heatmap(counts, f"{row_col} × {col_col} counts", "count"),
-        "row_percent_heatmap": make_heatmap(row_pct.fillna(0), f"{row_col} × {col_col} row %", "row %"),
+        "counts_heatmap": make_heatmap(counts, f"{row_col} Ã— {col_col} counts", "count"),
+        "row_percent_heatmap": make_heatmap(row_pct.fillna(0), f"{row_col} Ã— {col_col} row %", "row %"),
     }
 
 
@@ -577,7 +473,9 @@ def image_to_base64(img: np.ndarray) -> str:
     return plot_to_base64(fig)
 
 
-def sample_one_per_category(df: pd.DataFrame, col: str, rng: np.random.Generator, max_categories: int = 12) -> Dict[str, int]:
+def sample_one_per_category(
+    df: pd.DataFrame, col: str, rng: np.random.Generator, max_categories: int = 12
+) -> Dict[str, int]:
     if col not in df.columns:
         return {}
     counts = df[col].fillna("missing").astype(str).value_counts()
@@ -599,7 +497,18 @@ def sample_one_per_category(df: pd.DataFrame, col: str, rng: np.random.Generator
 
 
 def row_metadata(row: pd.Series) -> Dict[str, Any]:
-    keys = ["id", "patient", "dataset", "birads", "collapsed_birads", "original_birads", "machine", "machine_family", "view", "laterality"]
+    keys = [
+        "id",
+        "patient",
+        "dataset",
+        "birads",
+        "collapsed_birads",
+        "original_birads",
+        "machine",
+        "machine_family",
+        "view",
+        "laterality",
+    ]
     out: Dict[str, Any] = {}
     for key in keys:
         if key in row.index:
@@ -635,7 +544,7 @@ def build_image_examples(
     if len(df) > 0:
         random_count = min(random_n, len(df))
         random_idxs = rng.choice(df.index.to_numpy(), size=random_count, replace=False)
-        add_example_group("random_examples", {f"random_{i+1}": int(idx) for i, idx in enumerate(random_idxs)})
+        add_example_group("random_examples", {f"random_{i + 1}": int(idx) for i, idx in enumerate(random_idxs)})
 
     for col, group_name, max_cats in [
         ("collapsed_birads", "examples_by_collapsed_birads", 8),
@@ -651,7 +560,9 @@ def build_image_examples(
     return examples, html_sections
 
 
-def sample_image_intensity_summary(mmap: np.memmap, n_rows: int, rng: np.random.Generator, sample_n: int = 512) -> Dict[str, Any]:
+def sample_image_intensity_summary(
+    mmap: np.memmap, n_rows: int, rng: np.random.Generator, sample_n: int = 512
+) -> Dict[str, Any]:
     if n_rows == 0:
         return {}
     n = min(sample_n, n_rows)
@@ -840,7 +751,7 @@ def build_html(
 
     html_parts.append("<section><h2>2. Crosstables and confounding checks</h2>")
     for name, ct in crosstables.items():
-        html_parts.append(f"<h3>{html.escape(ct['rows'])} × {html.escape(ct['columns'])}</h3>")
+        html_parts.append(f"<h3>{html.escape(ct['rows'])} Ã— {html.escape(ct['columns'])}</h3>")
         html_parts.append("<h4>Counts</h4>")
         html_parts.append(crosstable_html(ct, "counts"))
         html_parts.append("<h4>Row percentages</h4>")
@@ -884,7 +795,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-html", type=Path, default=None)
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--no-images", action="store_true", help="Skip embedded image examples for faster/smaller reports.")
+    parser.add_argument(
+        "--no-images", action="store_true", help="Skip embedded image examples for faster/smaller reports."
+    )
     return parser.parse_args()
 
 
@@ -912,11 +825,6 @@ def main() -> None:
         print("view counts:", df["view"].fillna("missing").astype(str).value_counts().to_dict())
 
     bin_spec = infer_bin_spec(bin_path, len(df_raw))
-    if not bin_spec.exact_match:
-        warnings.append(
-            "BIN size did not exactly match known candidates; using fallback 512x512 uint16. "
-            "Check image shape/dtype if this is unexpected."
-        )
     mmap = open_memmap(bin_path, bin_spec, len(df_raw))
 
     overview: Dict[str, Any] = {
@@ -946,7 +854,9 @@ def main() -> None:
         view_counts = full_counts(df["view"])
         unknown = view_counts.get("unknown", 0) + view_counts.get("missing", 0)
         if unknown > 0:
-            warnings.append(f"view is unknown or could not be inferred for {100.0 * unknown / max(1, len(df)):.1f}% of rows.")
+            warnings.append(
+                f"view is unknown or could not be inferred for {100.0 * unknown / max(1, len(df)):.1f}% of rows."
+            )
     if "collapsed_birads" in df.columns:
         cb = full_counts(df["collapsed_birads"])
         if cb:

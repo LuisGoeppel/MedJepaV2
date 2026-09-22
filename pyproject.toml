@@ -17,7 +17,7 @@ test = ["pytest", "ruff"]
 opencv = ["opencv-python-headless"]
 
 [tool.setuptools.packages.find]
-include = ["core*", "supervised*"]
+include = ["core*", "supervised*", "dataset*", "analysis*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

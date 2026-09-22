@@ -15,14 +15,13 @@ Outputs:
   - <factor>_p_factor_given_class.csv
 
 Example:
-  python analyze_mg_factor_birads_baselines.py \
+  python -m analysis.analyze_mg_factor_birads_baselines \
     --csv /path/to/mg_test.csv \
     --out-dir /path/to/output \
     --factors view machine laterality
 """
 
 import argparse
-import json
 import math
 from pathlib import Path
 
@@ -30,18 +29,8 @@ import numpy as np
 import pandas as pd
 
 
-CLASS_ORDER = ["routine", "follow_up", "biopsy"]
-
-
-def parse_json_maybe(x):
-    if pd.isna(x):
-        return {}
-    if isinstance(x, dict):
-        return x
-    try:
-        return json.loads(str(x))
-    except Exception:
-        return {}
+from core.data import CLASS_NAMES as CLASS_ORDER, _safe_json_loads as parse_json_maybe, read_csv_clean
+from core.config import save_json
 
 
 def collapse_birads_value(x):
@@ -170,7 +159,6 @@ def evaluate_predictions(y_true, y_pred):
     for c in CLASS_ORDER:
         tp = int(((y_true == c) & (y_pred == c)).sum())
         fp = int(((y_true != c) & (y_pred == c)).sum())
-        fn = int(((y_true == c) & (y_pred != c)).sum())
         support = int((y_true == c).sum())
 
         recall = tp / support if support > 0 else float("nan")
@@ -301,9 +289,13 @@ def write_text_report(results, output_path):
     lines.append("=" * 60)
     lines.append("")
     lines.append("Interpretation:")
-    lines.append("  no_info_constant_routine: predicts routine for every image. Balanced accuracy is the 3-class no-information baseline.")
+    lines.append(
+        "  no_info_constant_routine: predicts routine for every image. Balanced accuracy is the 3-class no-information baseline."
+    )
     lines.append("  group_majority_factor_only: predicts the most common BI-RADS class within each factor value.")
-    lines.append("  balanced_optimal_factor_only: best possible deterministic classifier for balanced accuracy using only that factor.")
+    lines.append(
+        "  balanced_optimal_factor_only: best possible deterministic classifier for balanced accuracy using only that factor."
+    )
     lines.append("")
 
     for r in results:
@@ -321,9 +313,15 @@ def write_text_report(results, output_path):
         gm = r["group_majority_factor_only"]
         bo = r["balanced_optimal_factor_only"]
 
-        lines.append(f"No-info BA:             {base['balanced_accuracy']:.4f} | acc={base['accuracy']:.4f} | macro_f1={base['macro_f1']:.4f}")
-        lines.append(f"Group-majority BA:      {gm['metrics']['balanced_accuracy']:.4f} | delta={gm['delta_bal_acc_vs_no_info']:+.4f} | acc={gm['metrics']['accuracy']:.4f} | macro_f1={gm['metrics']['macro_f1']:.4f}")
-        lines.append(f"Balanced-optimal BA:    {bo['metrics']['balanced_accuracy']:.4f} | delta={bo['delta_bal_acc_vs_no_info']:+.4f} | acc={bo['metrics']['accuracy']:.4f} | macro_f1={bo['metrics']['macro_f1']:.4f}")
+        lines.append(
+            f"No-info BA:             {base['balanced_accuracy']:.4f} | acc={base['accuracy']:.4f} | macro_f1={base['macro_f1']:.4f}"
+        )
+        lines.append(
+            f"Group-majority BA:      {gm['metrics']['balanced_accuracy']:.4f} | delta={gm['delta_bal_acc_vs_no_info']:+.4f} | acc={gm['metrics']['accuracy']:.4f} | macro_f1={gm['metrics']['macro_f1']:.4f}"
+        )
+        lines.append(
+            f"Balanced-optimal BA:    {bo['metrics']['balanced_accuracy']:.4f} | delta={bo['delta_bal_acc_vs_no_info']:+.4f} | acc={bo['metrics']['accuracy']:.4f} | macro_f1={bo['metrics']['macro_f1']:.4f}"
+        )
         lines.append("")
         lines.append(f"Balanced-optimal mapping: {bo['mapping']}")
         lines.append(f"Group-majority mapping:   {gm['mapping']}")
@@ -346,7 +344,7 @@ def main():
     dfs = []
     for p in args.csv:
         p = Path(p)
-        d = pd.read_csv(p)
+        d = read_csv_clean(p)
         d["_source_csv"] = str(p)
         dfs.append(d)
 
@@ -361,8 +359,7 @@ def main():
         print(f"Analyzing factor: {factor}")
         results.append(analyze_factor(df, factor, out_dir, args.max_levels))
 
-    with open(out_dir / "factor_birads_report.json", "w") as f:
-        json.dump(results, f, indent=2)
+    save_json(results, out_dir / "factor_birads_report.json")
 
     write_text_report(results, out_dir / "factor_birads_report.txt")
 

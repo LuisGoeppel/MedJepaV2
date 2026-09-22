@@ -22,14 +22,15 @@ The script supports two split modes:
 from __future__ import annotations
 
 import argparse
-import json
-import re
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
+
+from core.config import slugify, save_json
+from core.data import infer_machine_family as infer_machine_family_from_machine, summarize_df
 
 DEFAULT_MG_DIR = Path("/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg")
 DEFAULT_FULL_CSV = DEFAULT_MG_DIR / "mg-only-all.csv"
@@ -38,49 +39,12 @@ DEFAULT_VAL_CSV = DEFAULT_MG_DIR / "splits" / "mg_val.csv"
 DEFAULT_TEST_CSV = DEFAULT_MG_DIR / "splits" / "mg_test.csv"
 
 
-def slugify(value: str) -> str:
-    value = value.strip().lower()
-    value = value.replace("/", "_")
-    value = re.sub(r"[^a-z0-9._-]+", "_", value)
-    value = re.sub(r"_+", "_", value)
-    return value.strip("_") or "unknown"
-
-
-def infer_machine_family_from_machine(machine: object) -> str:
-    """Best-effort machine-family inference if the CSV lacks a machine_family column."""
-    if pd.isna(machine):
-        return "unknown"
-
-    text = str(machine).lower()
-
-    # Hologic / Lorad variants.
-    if any(token in text for token in ["hologic", "lorad", "selenia", "dimensions", "lorad selenia"]):
-        return "Hologic/Lorad"
-
-    # Howtek / Lumisys variants. Some data sources spell it Lumisys, others Lumysis.
-    if any(token in text for token in ["howtek", "lumisys", "lumysis"]):
-        return "Howtek/Lumysis"
-
-    # GE / Senographe variants.
-    if any(token in text for token in ["senographe", "ge healthcare", "general electric"]):
-        return "GE/Senographe"
-
-    # Conservative GE fallback. Avoid matching arbitrary words containing "ge".
-    if re.search(r"(^|[^a-z])ge([^a-z]|$)", text):
-        return "GE/Senographe"
-
-    return "unknown"
-
-
 def ensure_machine_family_column(df: pd.DataFrame) -> pd.DataFrame:
     if "machine_family" in df.columns:
         return df
 
     if "machine" not in df.columns:
-        raise ValueError(
-            "CSV has neither 'machine_family' nor 'machine'. "
-            "Cannot filter by machine family."
-        )
+        raise ValueError("CSV has neither 'machine_family' nor 'machine'. Cannot filter by machine family.")
 
     df = df.copy()
     df["machine_family"] = df["machine"].map(infer_machine_family_from_machine)
@@ -135,6 +99,10 @@ def stratified_patient_split(
     if stratify_col not in df.columns:
         raise ValueError(f"Stratification column '{stratify_col}' not found in CSV.")
 
+    if df[group_col].isna().any():
+        raise ValueError("Missing group identifiers prevent a patient-disjoint split.")
+    if min(train_ratio, val_ratio, test_ratio) <= 0:
+        raise ValueError("Split ratios must be positive.")
     ratios = np.array([train_ratio, val_ratio, test_ratio], dtype=float)
     ratios = ratios / ratios.sum()
     train_ratio, val_ratio, test_ratio = ratios.tolist()
@@ -193,8 +161,8 @@ def stratified_patient_split(
         n_val = max(1, min(n_val, n - n_train - 1))
 
         train_groups = shuffled.iloc[:n_train]
-        val_groups = shuffled.iloc[n_train:n_train + n_val]
-        test_groups = shuffled.iloc[n_train + n_val:]
+        val_groups = shuffled.iloc[n_train : n_train + n_val]
+        test_groups = shuffled.iloc[n_train + n_val :]
 
     train_ids = set(train_groups[group_col])
     val_ids = set(val_groups[group_col])
@@ -218,25 +186,15 @@ def patient_overlap_report(splits: Dict[str, pd.DataFrame], group_col: str = "pa
     names = list(groups)
     report = {}
     for i, a in enumerate(names):
-        for b in names[i + 1:]:
+        for b in names[i + 1 :]:
             report[f"{a}_vs_{b}"] = len(groups[a] & groups[b])
     return report
 
 
-def summarize_split(df: pd.DataFrame) -> Dict[str, object]:
-    summary: Dict[str, object] = {
-        "rows": int(len(df)),
-    }
-
-    if "patient" in df.columns:
-        summary["patients"] = int(df["patient"].nunique(dropna=True))
-
-    for col in ["collapsed_birads", "birads", "birads_numeric", "view", "machine_family", "dataset", "machine"]:
-        if col in df.columns:
-            counts = df[col].fillna("missing").astype(str).value_counts().to_dict()
-            summary[f"{col}_counts"] = {str(k): int(v) for k, v in counts.items()}
-
-    return summary
+def summarize_split(df):
+    return summarize_df(
+        df, columns=["collapsed_birads", "birads", "birads_numeric", "view", "machine_family", "dataset", "machine"]
+    )
 
 
 def write_outputs(
@@ -265,7 +223,7 @@ def write_outputs(
         summary["filtered_full_summary"] = summarize_split(filtered_full)
 
     summary_path = output_dir / f"{prefix}_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    save_json(summary, summary_path)
 
     print("\nWrote split CSVs:")
     for name, path in paths.items():
@@ -369,6 +327,8 @@ def main() -> None:
 
     else:
         full_df = pd.read_csv(args.full_csv)
+        if "original_index" not in full_df:
+            full_df["original_index"] = np.arange(len(full_df))
         filtered_full = filter_df(full_df, args.machine_family, args.view)
 
         train_df, val_df, test_df = stratified_patient_split(

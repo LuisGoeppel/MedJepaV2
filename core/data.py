@@ -412,11 +412,11 @@ def open_memmap(bin_path: Path, spec: BinSpec, n_rows: int) -> np.memmap:
     return np.memmap(bin_path, dtype=dtype, mode="r", shape=shape)
 
 
-def summarize_df(df: pd.DataFrame) -> Dict[str, Any]:
+def summarize_df(df: pd.DataFrame, columns=("collapsed_birads", "machine_family", "view", "dataset")) -> Dict[str, Any]:
     summary: Dict[str, Any] = {"rows": int(len(df))}
     if "patient" in df.columns:
         summary["patients"] = int(df["patient"].nunique(dropna=True))
-    for col in ["collapsed_birads", "machine_family", "view", "dataset"]:
+    for col in columns:
         if col in df.columns:
             summary[f"{col}_counts"] = {
                 str(k): int(v) for k, v in df[col].fillna("missing").astype(str).value_counts().to_dict().items()

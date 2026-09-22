@@ -16,6 +16,27 @@ from .transforms import evaluation_transform
 
 
 @torch.inference_mode()
+def extract_embedding_batches(model, loader, device, amp, description, *, projector=False):
+    """Extract ordered single-image or single-view batches, optionally with projections."""
+    embeddings, projections, indices = [], [], []
+    model.eval()
+    for images, index in tqdm(loader, desc=description):
+        if images.ndim == 5:
+            if images.shape[1] != 1:
+                raise ValueError("Analysis extraction requires one view per row.")
+            images = images.flatten(0, 1)
+        with autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bool(amp and device.type == "cuda")):
+            embedding = model.backbone(images.to(device, non_blocking=True))
+            if projector:
+                projections.append(model.proj(embedding).float().cpu())
+        embeddings.append(embedding.float().cpu())
+        indices.append(index.cpu())
+    if not embeddings:
+        raise ValueError("Cannot extract representations from an empty dataset.")
+    return torch.cat(embeddings), torch.cat(projections) if projector else None, torch.cat(indices)
+
+
+@torch.inference_mode()
 def extract_features(df, bin_path, n_full, model_cfg, aug_cfg, model, device, settings, split_name):
     if df.empty:
         raise ValueError(f"Cannot extract features from empty {split_name} split")
@@ -39,16 +60,9 @@ def extract_features(df, bin_path, n_full, model_cfg, aug_cfg, model, device, se
         pin_memory=device.type == "cuda",
         collate_fn=collate_batch,
     )
-    embeddings, indices = [], []
-    model.eval()
-    for views, index in tqdm(loader, desc=f"Extract features [{split_name}]"):
-        with autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            # Reports need the backbone only; avoid evaluating the unused projector.
-            emb = model.backbone(views.to(device, non_blocking=True).flatten(0, 1))
-        embeddings.append(emb.float().cpu())
-        indices.append(index)
-    ordered = df.iloc[torch.cat(indices).numpy()].reset_index(drop=True)
-    return torch.cat(embeddings), ordered
+    embeddings, _, indices = extract_embedding_batches(model, loader, device, True, f"Extract features [{split_name}]")
+    ordered = df.iloc[indices.numpy()].reset_index(drop=True)
+    return embeddings, ordered
 
 
 def run_analysis(

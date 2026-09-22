@@ -1,6 +1,8 @@
 """Stateless plotting functions used by training and experiment reports."""
 
 from __future__ import annotations
+import base64
+import io
 from typing import Any
 from matplotlib.backends.backend_pdf import PdfPages
 from pathlib import Path
@@ -463,6 +465,26 @@ def plot_resolution_summary(output_dir, summary_df, results):
     print(f"Wrote summary CSV:  {output_dir / 'summary.csv'}")
     print(f"Wrote summary JSON: {output_dir / 'summary.json'}")
     print(f"Wrote summary PDF:  {pdf_path}")
+
+
+def figure_to_base64(fig, dpi=135):
+    """Serialize and close a figure for a self-contained HTML report."""
+    with io.BytesIO() as buffer:
+        fig.savefig(buffer, format="png", dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def plot_finite_histogram(ax, values, bins=60):
+    """Handle nearly constant floating-point data without duplicate bin edges."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    limits = None
+    if len(values) and np.isclose(values.min(), values.max(), rtol=1e-12, atol=1e-12):
+        center = float(values.mean())
+        margin = max(1.0, abs(center)) * 0.01
+        limits = (center - margin, center + margin)
+    return ax.hist(values, bins=bins, range=limits)
 
 
 def plot_baseline_history(history, out_path):

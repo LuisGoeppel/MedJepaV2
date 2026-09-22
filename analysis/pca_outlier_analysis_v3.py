@@ -34,18 +34,29 @@ Optional: opencv-python (only if CLAHE/top-corner component logic is enabled by 
 """
 
 from __future__ import annotations
+from types import SimpleNamespace
+from core.config import save_json
+from core.data import (
+    read_csv_clean,
+    set_seed,
+    normalize_birads_value,
+    collapse_birads_numeric,
+    MammographyDataset,
+    validate_bin,
+    ensure_original_index as validate_original_index,
+)
+from core.transforms import ConfigurableMGAugmentation
+from core.models import ViTEncoder, build_projector, model_hints
+from core.features import extract_embedding_batches
+from core.plotting import plot_finite_histogram, figure_to_base64
+
 
 import argparse
-import base64
 import gc
 import html
-import io
 import json
 import math
-import os
-import random
 import re
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,22 +65,11 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms.functional as TF
 from matplotlib import pyplot as plt
-from PIL import Image
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 from torch.amp import autocast
-from torch.utils.data import DataLoader, Dataset
-from torchvision.transforms import InterpolationMode, RandomResizedCrop
-from tqdm.auto import tqdm
-
-try:
-    import timm
-except ImportError as exc:
-    raise ImportError("Missing dependency: timm. Install with: pip install timm") from exc
+from torch.utils.data import DataLoader
 
 
 CLASS_NAMES = ["routine", "follow_up", "biopsy"]
@@ -79,18 +79,6 @@ CLASS_TO_INDEX = {name: i for i, name in enumerate(CLASS_NAMES)}
 # -----------------------------------------------------------------------------
 # Generic utilities
 # -----------------------------------------------------------------------------
-
-def save_json(obj: Any, path: str | Path) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, default=str)
-
-
-def read_csv_clean(path: str | Path) -> pd.DataFrame:
-    df = pd.read_csv(path, low_memory=False)
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
 
 
 def robust_location_scale(x: np.ndarray) -> tuple[float, float]:
@@ -133,20 +121,12 @@ def safe_scalar(v: Any) -> Any:
     return v
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
 def strip_module_prefix(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     out = {}
     for k, v in state.items():
         kk = str(k)
         while kk.startswith("module."):
-            kk = kk[len("module."):]
+            kk = kk[len("module.") :]
         out[kk] = v
     return out
 
@@ -170,31 +150,6 @@ def fmt_num(x: Any, digits: int = 3) -> str:
 # -----------------------------------------------------------------------------
 # Labels / metadata / split loading
 # -----------------------------------------------------------------------------
-
-def normalize_birads_value(x: Any) -> float:
-    if pd.isna(x):
-        return np.nan
-    s = str(x).strip().lower()
-    for k in ["1", "2", "3", "4", "5"]:
-        if s == k or s.startswith(k + ".") or s.startswith(k + " ") or f"({k})" in s:
-            return int(k)
-    try:
-        return int(float(s))
-    except Exception:
-        return np.nan
-
-
-def collapse_birads_numeric(x: float) -> str:
-    if pd.isna(x):
-        return "unknown"
-    x = int(x)
-    if x in (1, 2):
-        return "routine"
-    if x == 3:
-        return "follow_up"
-    if x in (4, 5):
-        return "biopsy"
-    return "unknown"
 
 
 def prepare_labels(df: pd.DataFrame) -> pd.DataFrame:
@@ -267,8 +222,7 @@ def ensure_original_index(
     split_df = split_df.copy()
 
     if "original_index" in split_df.columns:
-        split_df["original_index"] = split_df["original_index"].astype(int)
-        return split_df
+        return validate_original_index(split_df, full_df_raw, split_name)
 
     # Try single columns first. `exam` is unique in the current MG dataset, whereas
     # `id` is not guaranteed to be unique.
@@ -290,11 +244,10 @@ def ensure_original_index(
         if mapped.notna().all():
             split_df["original_index"] = mapped.astype(int)
             print(
-                f"[index mapping] {split_name}: matched {len(split_df):,} rows "
-                f"using unique key '{key}'.",
+                f"[index mapping] {split_name}: matched {len(split_df):,} rows using unique key '{key}'.",
                 flush=True,
             )
-            return split_df
+            return validate_original_index(split_df, full_df_raw, split_name)
 
     # Fall back to composite keys. Keep the candidates conservative so the mapping
     # remains interpretable and deterministic.
@@ -307,12 +260,7 @@ def ensure_original_index(
     ]
 
     def make_composite(df: pd.DataFrame, cols: list[str]) -> pd.Series:
-        return (
-            df[cols]
-            .fillna("<NA>")
-            .astype(str)
-            .agg("||".join, axis=1)
-        )
+        return df[cols].fillna("<NA>").astype(str).agg("||".join, axis=1)
 
     for cols in composite_candidates:
         if not all(c in split_df.columns and c in full_df_raw.columns for c in cols):
@@ -332,11 +280,10 @@ def ensure_original_index(
         if mapped.notna().all():
             split_df["original_index"] = mapped.astype(int)
             print(
-                f"[index mapping] {split_name}: matched {len(split_df):,} rows "
-                f"using composite key {cols}.",
+                f"[index mapping] {split_name}: matched {len(split_df):,} rows using composite key {cols}.",
                 flush=True,
             )
-            return split_df
+            return validate_original_index(split_df, full_df_raw, split_name)
 
     # Give a useful diagnostic instead of silently making an ambiguous assignment.
     duplicate_id_count = None
@@ -356,6 +303,7 @@ def ensure_original_index(
 # -----------------------------------------------------------------------------
 # Checkpoint/model reconstruction
 # -----------------------------------------------------------------------------
+
 
 def cfg_get(cfg: dict[str, Any], *names: str, default: Any = None) -> Any:
     for name in names:
@@ -418,7 +366,10 @@ def infer_architecture(payload: dict[str, Any]) -> dict[str, Any]:
     if not backbone_name:
         backbone_name = f"vit_small_patch{patch_size}_224"
 
+    hints = model_hints(payload)
+    backbone_output_dim = hints.get("backbone_output_dim", backbone_output_dim)
     return {
+        "backbone_num_classes": hints.get("backbone_num_classes", backbone_output_dim),
         "backbone_name": str(backbone_name),
         "image_size": image_size,
         "backbone_output_dim": int(backbone_output_dim),
@@ -436,33 +387,6 @@ def infer_architecture(payload: dict[str, Any]) -> dict[str, Any]:
         "script_version": payload.get("script_version", "unknown"),
         "checkpoint_epoch": payload.get("epoch", None),
     }
-
-
-class ViTEncoder(nn.Module):
-    def __init__(self, arch: dict[str, Any]):
-        super().__init__()
-        self.backbone = timm.create_model(
-            arch["backbone_name"],
-            pretrained=False,
-            num_classes=int(arch["backbone_output_dim"]),
-            drop_path_rate=float(arch.get("drop_path_rate", 0.0)),
-            img_size=int(arch["image_size"]),
-            in_chans=1,
-        )
-        self.proj = nn.Sequential(
-            nn.Linear(int(arch["backbone_output_dim"]), int(arch["projector_hidden_dim"])),
-            nn.BatchNorm1d(int(arch["projector_hidden_dim"])),
-            nn.ReLU(inplace=True),
-            nn.Linear(int(arch["projector_hidden_dim"]), int(arch["projector_hidden_dim"])),
-            nn.BatchNorm1d(int(arch["projector_hidden_dim"])),
-            nn.ReLU(inplace=True),
-            nn.Linear(int(arch["projector_hidden_dim"]), int(arch["projection_dim"])),
-        )
-
-    def encode_one(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        emb = self.backbone(x)
-        proj = self.proj(emb)
-        return emb, proj
 
 
 def load_weights_into_existing_model(
@@ -517,15 +441,9 @@ def rebuild_projector_in_place(
     device: torch.device,
 ) -> None:
     """Rebuild only the projector MLP without constructing a new timm ViT."""
-    model.proj = nn.Sequential(
-        nn.Linear(int(arch["backbone_output_dim"]), int(arch["projector_hidden_dim"])),
-        nn.BatchNorm1d(int(arch["projector_hidden_dim"])),
-        nn.ReLU(inplace=True),
-        nn.Linear(int(arch["projector_hidden_dim"]), int(arch["projector_hidden_dim"])),
-        nn.BatchNorm1d(int(arch["projector_hidden_dim"])),
-        nn.ReLU(inplace=True),
-        nn.Linear(int(arch["projector_hidden_dim"]), int(arch["projection_dim"])),
-    ).to(device)
+    model.proj = build_projector(arch["backbone_output_dim"], arch["projector_hidden_dim"], arch["projection_dim"]).to(
+        device
+    )
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
@@ -533,7 +451,7 @@ def rebuild_projector_in_place(
 
 def build_model(payload: dict[str, Any], device: torch.device) -> tuple[ViTEncoder, dict[str, Any], dict[str, Any]]:
     arch = infer_architecture(payload)
-    model = ViTEncoder(arch).to(device)
+    model = ViTEncoder(SimpleNamespace(**arch)).to(device)
     load_info = load_weights_into_existing_model(model, payload, "Primary")
     return model, arch, load_info
 
@@ -542,387 +460,28 @@ def build_model(payload: dict[str, Any], device: torch.device) -> tuple[ViTEncod
 # Mammography preprocessing / augmentation
 # -----------------------------------------------------------------------------
 
-def deep_get(dct: dict[str, Any], keys: list[str], default: Any) -> Any:
-    cur: Any = dct
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
 
+class MGAnalysisDataset(MammographyDataset):
+    load_raw_tensor = MammographyDataset.image_at
 
-class ConfigurableMGAugmentation(nn.Module):
-    _warned_no_cv2 = False
-
-    def __init__(self, aug_cfg: dict[str, Any], image_size: int, train: bool):
-        super().__init__()
-        self.cfg = aug_cfg or {}
-        self.image_size = int(image_size)
-        self.train = bool(train)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self._foreground_crop(x)
-        x = self._mask_top_corner(x)
-
-        if self.train:
-            pre_resize_cfg = deep_get(self.cfg, ["preprocessing", "resize_after_foreground_crop"], {})
-            if pre_resize_cfg.get("enabled", True):
-                x = self._resize(x, int(pre_resize_cfg.get("size", max(self.image_size, 256))))
-            else:
-                x = self._resize(x, self.image_size)
-            x = self._random_resized_crop(x)
-            x = self._horizontal_flip(x)
-            x = self._vertical_flip(x)
-            x = self._large_rotation(x)
-            x = self._random_affine(x)
-            x = self._gamma(x)
-            x = self._brightness_contrast(x)
-            x = self._noise(x)
-            x = self._blur(x)
-            x = self._sharpen(x)
-            x = self._histogram_equalization(x)
-            x = self._clahe(x)
-            x = self._intensity_inversion(x)
-            x = self._posterization(x)
-            x = self._random_erasing(x)
-            x = self._cutout(x)
-            return x.float().clamp(0, 1)
-
-        return self._resize(x, self.image_size).float().clamp(0, 1)
-
-    def _foreground_crop(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["preprocessing", "foreground_crop"], {})
-        if not c.get("enabled", False):
-            return x
-        threshold = float(c.get("threshold_abs", 1e-6))
-        margin_frac = float(c.get("margin_frac", 0.05))
-        min_area_frac = float(c.get("min_foreground_area_frac", 0.01))
-        fallback = bool(c.get("fallback_to_original", True))
-        mask = x[0] > threshold
-        ys, xs = torch.where(mask)
-        h, w = x.shape[-2:]
-        if len(xs) < int(h * w * min_area_frac):
-            return x if fallback else x[:, :h, :w]
-        y0, y1 = int(ys.min()), int(ys.max()) + 1
-        x0, x1 = int(xs.min()), int(xs.max()) + 1
-        mh = int((y1 - y0) * margin_frac)
-        mw = int((x1 - x0) * margin_frac)
-        return x[:, max(0, y0 - mh):min(h, y1 + mh), max(0, x0 - mw):min(w, x1 + mw)]
-
-    def _mask_top_corner(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["preprocessing", "top_right_corner_mask"], {})
-        if not c.get("enabled", False):
-            return x
-        frac_x = float(c.get("frac_x", 0.30))
-        frac_y = float(c.get("frac_y", 0.12))
-        value = float(c.get("value", 0.0))
-        foreground_threshold = float(c.get("foreground_threshold", 1e-4))
-        min_component_area_frac = float(c.get("min_component_area_frac", 0.0002))
-        skip_if_single_component = bool(c.get("skip_if_single_component", True))
-
-        _, h, w = x.shape
-        mh = max(1, int(round(h * frac_y)))
-        mw = max(1, int(round(w * frac_x)))
-        foreground = x[0] > foreground_threshold
-
-        if skip_if_single_component:
-            try:
-                import cv2  # type: ignore
-                mask_np = foreground.detach().cpu().numpy().astype("uint8")
-                num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask_np, connectivity=8)
-                min_area = max(1, int(round(h * w * min_component_area_frac)))
-                relevant = 0
-                for label_idx in range(1, num_labels):
-                    if int(stats[label_idx, cv2.CC_STAT_AREA]) >= min_area:
-                        relevant += 1
-                if relevant <= 1:
-                    return x
-            except Exception:
-                pass
-
-        left = foreground[:, : w // 2].float().sum().item()
-        right = foreground[:, w // 2:].float().sum().item()
-        x = x.clone()
-        if left <= right:
-            x[:, :mh, :mw] = value
-        else:
-            x[:, :mh, w - mw:] = value
-        return x
-
-    @staticmethod
-    def _resize(x: torch.Tensor, size: int) -> torch.Tensor:
-        return TF.resize(x, [size, size], interpolation=InterpolationMode.BILINEAR, antialias=True)
-
-    def _random_resized_crop(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["spatial", "random_resized_crop"], {})
-        if not c.get("enabled", False):
-            return self._resize(x, self.image_size)
-        scale = tuple(c.get("scale", [0.85, 1.0]))
-        ratio = tuple(c.get("ratio", [0.9, 1.1]))
-        size = int(c.get("size", self.image_size))
-        i, j, h, w = RandomResizedCrop.get_params(x, scale=scale, ratio=ratio)
-        return TF.resized_crop(
-            x, i, j, h, w, [size, size],
-            interpolation=InterpolationMode.BILINEAR, antialias=True
-        )
-
-    def _horizontal_flip(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["spatial", "horizontal_flip"], {})
-        if c.get("enabled", False) and random.random() < float(c.get("p", 0.5)):
-            return TF.hflip(x)
-        return x
-
-    def _vertical_flip(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["spatial", "vertical_flip"], {})
-        if c.get("enabled", False) and random.random() < float(c.get("p", 0.0)):
-            return TF.vflip(x)
-        return x
-
-    def _large_rotation(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["spatial", "large_rotation_90_180"], {})
-        if c.get("enabled", False) and random.random() < float(c.get("p", 0.0)):
-            angle = random.choice(c.get("angles", [90, 180, 270]))
-            return TF.rotate(x, angle=angle, interpolation=InterpolationMode.BILINEAR, fill=[0.0])
-        return x
-
-    def _random_affine(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["spatial", "random_affine"], {})
-        if not c.get("enabled", False) or random.random() > float(c.get("p", 0.5)):
-            return x
-        degrees = float(c.get("degrees", 3.0))
-        tr = c.get("translate", [0.02, 0.02])
-        sc = c.get("scale", [0.97, 1.03])
-        sh = c.get("shear", [0.0, 0.0])
-        angle = random.uniform(-degrees, degrees)
-        h, w = x.shape[-2:]
-        tx = int(random.uniform(-float(tr[0]), float(tr[0])) * w)
-        ty = int(random.uniform(-float(tr[1]), float(tr[1])) * h)
-        scale = random.uniform(float(sc[0]), float(sc[1]))
-        shear = [random.uniform(float(sh[0]), float(sh[1])), 0.0]
-        return TF.affine(
-            x, angle=angle, translate=[tx, ty], scale=scale, shear=shear,
-            interpolation=InterpolationMode.BILINEAR, fill=[float(c.get("fill", 0.0))]
-        )
-
-    def _gamma(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["intensity", "random_gamma"], {})
-        if c.get("enabled", False) and random.random() < float(c.get("p", 0.5)):
-            g = c.get("gamma", [0.9, 1.1])
-            return x.clamp(0, 1).pow(random.uniform(float(g[0]), float(g[1])))
-        return x
-
-    def _brightness_contrast(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["intensity", "brightness_contrast"], {})
-        if not c.get("enabled", False) or random.random() > float(c.get("p", 0.5)):
-            return x
-        b = c.get("brightness", [0.95, 1.05])
-        co = c.get("contrast", [0.9, 1.1])
-        brightness = random.uniform(float(b[0]), float(b[1]))
-        contrast = random.uniform(float(co[0]), float(co[1]))
-        mean = x.mean(dim=(-2, -1), keepdim=True)
-        return ((x - mean) * contrast + mean).mul(brightness).clamp(0, 1)
-
-    def _noise(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["intensity", "gaussian_noise"], {})
-        if c.get("enabled", False) and random.random() < float(c.get("p", 0.2)):
-            sr = c.get("std", [0.0, 0.01])
-            std = random.uniform(float(sr[0]), float(sr[1]))
-            out = x + torch.randn_like(x) * std
-            return out.clamp(0, 1) if c.get("clip", True) else out
-        return x
-
-    def _blur(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["intensity", "gaussian_blur"], {})
-        if c.get("enabled", False) and random.random() < float(c.get("p", 0.1)):
-            k = int(c.get("kernel_size", 3))
-            if k % 2 == 0:
-                k += 1
-            return TF.gaussian_blur(x, kernel_size=[k, k], sigma=tuple(c.get("sigma", [0.1, 0.6])))
-        return x
-
-    def _sharpen(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["intensity", "sharpen"], {})
-        if c.get("enabled", False) and random.random() < float(c.get("p", 0.0)):
-            factors = c.get("sharpness_factor", [1.0, 1.2])
-            factor = random.uniform(float(factors[0]), float(factors[1]))
-            return TF.adjust_sharpness(x, sharpness_factor=factor).clamp(0, 1)
-        return x
-
-    @staticmethod
-    def _to_uint8(x: torch.Tensor) -> torch.Tensor:
-        return (x.clamp(0, 1) * 255.0).round().to(torch.uint8)
-
-    @staticmethod
-    def _from_uint8(x: torch.Tensor) -> torch.Tensor:
-        return x.float() / 255.0
-
-    def _histogram_equalization(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["intensity", "histogram_equalization"], {})
-        if c.get("enabled", False) and random.random() < float(c.get("p", 1.0)):
-            return self._from_uint8(TF.equalize(self._to_uint8(x))).clamp(0, 1)
-        return x
-
-    def _clahe(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["intensity", "clahe"], {})
-        if not (c.get("enabled", False) and random.random() < float(c.get("p", 1.0))):
-            return x
-        try:
-            import cv2  # type: ignore
-            arr = (x.squeeze(0).detach().cpu().numpy().clip(0, 1) * 255).astype(np.uint8)
-            clahe = cv2.createCLAHE(
-                clipLimit=float(c.get("clip_limit", 2.0)),
-                tileGridSize=tuple(c.get("tile_grid_size", [8, 8])),
-            )
-            out = clahe.apply(arr).astype(np.float32) / 255.0
-            return torch.from_numpy(out).unsqueeze(0).to(dtype=x.dtype)
-        except Exception:
-            if not ConfigurableMGAugmentation._warned_no_cv2:
-                print("WARNING: CLAHE requested but OpenCV/cv2 is unavailable or failed. Skipping CLAHE.")
-                ConfigurableMGAugmentation._warned_no_cv2 = True
-            return x
-
-    def _intensity_inversion(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["intensity", "intensity_inversion"], {})
-        if c.get("enabled", False) and random.random() < float(c.get("p", 1.0)):
-            return 1.0 - x
-        return x
-
-    def _posterization(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["intensity", "posterization"], {})
-        if c.get("enabled", False) and random.random() < float(c.get("p", 1.0)):
-            bits = max(1, min(8, int(c.get("bits", 6))))
-            return self._from_uint8(TF.posterize(self._to_uint8(x), bits=bits)).clamp(0, 1)
-        return x
-
-    def _random_erasing(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["occlusion", "random_erasing"], {})
-        if not (c.get("enabled", False) and random.random() < float(c.get("p", 0.0))):
-            return x
-        scale = c.get("scale", [0.01, 0.03])
-        ratio = c.get("ratio", [0.3, 3.3])
-        value = float(c.get("value", 0.0))
-        _, h, w = x.shape
-        area = h * w
-        for _ in range(10):
-            target = random.uniform(float(scale[0]), float(scale[1])) * area
-            aspect = math.exp(random.uniform(math.log(float(ratio[0])), math.log(float(ratio[1]))))
-            erase_h = int(round(math.sqrt(target * aspect)))
-            erase_w = int(round(math.sqrt(target / aspect)))
-            if erase_h < h and erase_w < w:
-                i = random.randint(0, h - erase_h)
-                j = random.randint(0, w - erase_w)
-                x = x.clone()
-                x[:, i:i + erase_h, j:j + erase_w] = value
-                return x
-        return x
-
-    def _cutout(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.cfg, ["occlusion", "cutout"], {})
-        if not (c.get("enabled", False) and random.random() < float(c.get("p", 0.0))):
-            return x
-        size_frac = float(c.get("size_frac", 0.05))
-        value = float(c.get("value", 0.0))
-        _, h, w = x.shape
-        ch = max(1, int(h * size_frac))
-        cw = max(1, int(w * size_frac))
-        i = random.randint(0, max(0, h - ch))
-        j = random.randint(0, max(0, w - cw))
-        x = x.clone()
-        x[:, i:i + ch, j:j + cw] = value
-        return x
-
-
-class MGAnalysisDataset(Dataset):
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        bin_path: str | Path,
-        full_num_rows: int,
-        image_shape: tuple[int, int],
-        dtype: str,
-        transform: nn.Module,
-        normalize_mode: str,
-        percentile_low: float,
-        percentile_high: float,
-    ):
-        self.df = df.reset_index(drop=True)
-        self.bin_path = Path(bin_path)
-        self.full_num_rows = int(full_num_rows)
-        self.image_shape = tuple(image_shape)
-        self.dtype = np.dtype(dtype)
-        self.transform = transform
-        self.normalize_mode = normalize_mode
-        self.percentile_low = float(percentile_low)
-        self.percentile_high = float(percentile_high)
-        self._imgs: Optional[np.memmap] = None
-
-    def __len__(self) -> int:
-        return len(self.df)
-
-    def _open(self) -> np.memmap:
-        if self._imgs is None:
-            self._imgs = np.memmap(
-                self.bin_path,
-                dtype=self.dtype,
-                mode="r",
-                shape=(self.full_num_rows, *self.image_shape),
-            )
-        return self._imgs
-
-    def load_raw_tensor(self, dataset_idx: int) -> torch.Tensor:
-        row = self.df.iloc[int(dataset_idx)]
-        arr = self._open()[int(row["original_index"])].astype(np.float32)
-        if self.normalize_mode == "uint16":
-            if self.dtype == np.dtype("uint16"):
-                arr = arr / 65535.0
-            else:
-                arr = arr / max(float(arr.max()), 1.0)
-        elif self.normalize_mode == "per_image_percentile":
-            lo, hi = np.percentile(arr, [self.percentile_low, self.percentile_high])
-            arr = np.zeros_like(arr, dtype=np.float32) if hi <= lo else np.clip((arr - lo) / (hi - lo), 0, 1)
-        else:
-            raise ValueError(f"Unknown normalize_mode: {self.normalize_mode}")
-        return torch.from_numpy(arr).unsqueeze(0).float().clamp(0, 1)
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.load_raw_tensor(int(idx))
-        x = self.transform(x)
-        return x, torch.tensor(int(idx), dtype=torch.long)
+    def __getitem__(self, idx):
+        return self.transform(self.image_at(idx)), torch.tensor(int(idx), dtype=torch.long)
 
 
 # -----------------------------------------------------------------------------
 # Feature extraction
 # -----------------------------------------------------------------------------
 
-@torch.no_grad()
-def extract_representations(
-    model: ViTEncoder,
-    loader: DataLoader,
-    device: torch.device,
-    use_amp: bool,
-    desc: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    embeddings: list[np.ndarray] = []
-    projections: list[np.ndarray] = []
-    use_cuda = device.type == "cuda"
 
-    for x, _ in tqdm(loader, desc=desc):
-        x = x.to(device, non_blocking=True)
-        with autocast(
-            device_type=device.type,
-            dtype=torch.bfloat16 if use_cuda else torch.float32,
-            enabled=bool(use_amp and use_cuda),
-        ):
-            emb, proj = model.encode_one(x)
-        embeddings.append(emb.detach().float().cpu().numpy())
-        projections.append(proj.detach().float().cpu().numpy())
-
-    return np.concatenate(embeddings, axis=0), np.concatenate(projections, axis=0)
+def extract_representations(model, loader, device, use_amp, desc):
+    embeddings, projections, _ = extract_embedding_batches(model, loader, device, use_amp, desc, projector=True)
+    return embeddings.numpy(), projections.numpy()
 
 
 # -----------------------------------------------------------------------------
 # Representation statistics and outlier screening
 # -----------------------------------------------------------------------------
+
 
 def covariance_eigenvalues(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
@@ -1068,10 +627,6 @@ def fit_iterative_global_pca_outliers(
     max_allowed = max(1, int(math.floor(max_outlier_fraction * n)))
     iteration_history: list[dict[str, Any]] = []
 
-    last_score = np.zeros(n, dtype=np.float64)
-    last_dom_pc = np.zeros(n, dtype=np.int32)
-    last_signed_z = np.zeros(n, dtype=np.float64)
-
     for iteration in range(1, max(1, int(max_iterations)) + 1):
         ref_idx = np.where(~global_mask)[0]
         if len(ref_idx) < 3:
@@ -1093,46 +648,44 @@ def fit_iterative_global_pca_outliers(
         signed_z = (all_coords - pc_med[None, :]) / pc_scale[None, :]
         abs_z = np.abs(signed_z)
         score = abs_z.max(axis=1)
-        dom_pc = abs_z.argmax(axis=1).astype(np.int32) + 1
-        dom_signed_z = signed_z[np.arange(n), dom_pc - 1]
 
         candidate = score >= float(z_threshold)
         new_mask = candidate & ~global_mask
         new_idx = np.where(new_mask)[0]
-
-        last_score = score
-        last_dom_pc = dom_pc
-        last_signed_z = dom_signed_z
 
         raw_new_count = int(len(new_idx))
         cumulative_before = int(global_mask.sum())
         remaining_capacity = max_allowed - cumulative_before
 
         if raw_new_count == 0:
-            iteration_history.append({
-                "iteration": int(iteration),
-                "reference_rows": int(len(ref_idx)),
-                "candidates_above_threshold_total": int(candidate.sum()),
-                "new_candidates_before_cap": 0,
-                "accepted_new_outliers": 0,
-                "cumulative_outliers": cumulative_before,
-                "cap_hit_this_iteration": False,
-                "max_abs_robust_pc_z": float(np.max(score)),
-            })
+            iteration_history.append(
+                {
+                    "iteration": int(iteration),
+                    "reference_rows": int(len(ref_idx)),
+                    "candidates_above_threshold_total": int(candidate.sum()),
+                    "new_candidates_before_cap": 0,
+                    "accepted_new_outliers": 0,
+                    "cumulative_outliers": cumulative_before,
+                    "cap_hit_this_iteration": False,
+                    "max_abs_robust_pc_z": float(np.max(score)),
+                }
+            )
             break
 
         if remaining_capacity <= 0:
             capped = True
-            iteration_history.append({
-                "iteration": int(iteration),
-                "reference_rows": int(len(ref_idx)),
-                "candidates_above_threshold_total": int(candidate.sum()),
-                "new_candidates_before_cap": raw_new_count,
-                "accepted_new_outliers": 0,
-                "cumulative_outliers": cumulative_before,
-                "cap_hit_this_iteration": True,
-                "max_abs_robust_pc_z": float(np.max(score)),
-            })
+            iteration_history.append(
+                {
+                    "iteration": int(iteration),
+                    "reference_rows": int(len(ref_idx)),
+                    "candidates_above_threshold_total": int(candidate.sum()),
+                    "new_candidates_before_cap": raw_new_count,
+                    "accepted_new_outliers": 0,
+                    "cumulative_outliers": cumulative_before,
+                    "cap_hit_this_iteration": True,
+                    "max_abs_robust_pc_z": float(np.max(score)),
+                }
+            )
             break
 
         accepted_before_cap = raw_new_count
@@ -1149,16 +702,18 @@ def fit_iterative_global_pca_outliers(
         global_mask[new_idx] = True
         iteration_found[new_idx] = iteration
 
-        iteration_history.append({
-            "iteration": int(iteration),
-            "reference_rows": int(len(ref_idx)),
-            "candidates_above_threshold_total": int(candidate.sum()),
-            "new_candidates_before_cap": int(accepted_before_cap),
-            "accepted_new_outliers": int(len(new_idx)),
-            "cumulative_outliers": int(global_mask.sum()),
-            "cap_hit_this_iteration": bool(cap_hit_this_iteration),
-            "max_abs_robust_pc_z": float(np.max(score)),
-        })
+        iteration_history.append(
+            {
+                "iteration": int(iteration),
+                "reference_rows": int(len(ref_idx)),
+                "candidates_above_threshold_total": int(candidate.sum()),
+                "new_candidates_before_cap": int(accepted_before_cap),
+                "accepted_new_outliers": int(len(new_idx)),
+                "cumulative_outliers": int(global_mask.sum()),
+                "cap_hit_this_iteration": bool(cap_hit_this_iteration),
+                "max_abs_robust_pc_z": float(np.max(score)),
+            }
+        )
 
         if capped:
             break
@@ -1227,10 +782,7 @@ def _mean_knn_distance_to_reference(
     distances, indices = nn.kneighbors(query_zw)
 
     out = np.empty(len(query_zw), dtype=np.float64)
-    ref_pos = {
-        int(orig_idx): pos
-        for pos, orig_idx in enumerate(reference_original_indices.tolist())
-    }
+    ref_pos = {int(orig_idx): pos for pos, orig_idx in enumerate(reference_original_indices.tolist())}
 
     for i in range(len(query_zw)):
         d = distances[i]
@@ -1355,12 +907,14 @@ def fit_outlier_screen(
     local_strong = (votes >= 2) | (knn_ratio >= hard_knn_ratio)
     strong = global_mask | local_strong
 
-    local_score = np.maximum.reduce([
-        np.maximum(radius_z, 0.0),
-        np.maximum(norm_z, 0.0),
-        np.maximum(knn_z, 0.0),
-        np.log2(np.maximum(knn_ratio, 1.0)) * 2.0,
-    ])
+    local_score = np.maximum.reduce(
+        [
+            np.maximum(radius_z, 0.0),
+            np.maximum(norm_z, 0.0),
+            np.maximum(knn_z, 0.0),
+            np.log2(np.maximum(knn_ratio, 1.0)) * 2.0,
+        ]
+    )
     score = np.maximum(local_score, global_score)
     pct = percentile_ranks(score)
 
@@ -1384,29 +938,31 @@ def fit_outlier_screen(
     # Record which global iteration found each point by replaying only for the final
     # mask is unnecessary for decisions; -1 means "not global". For the report we use
     # a binary global flag and final robust-PC score/PC index.
-    metrics = pd.DataFrame({
-        "global_is_outlier": global_mask,
-        "global_iteration_found": iteration_found,
-        "global_max_abs_pc_z": global_score,
-        "global_dominant_pc": global_dom_pc,
-        "global_dominant_signed_z": global_dom_signed_z,
-        "global_detection_capped": np.full(n, bool(global_capped)),
-        "local_is_outlier": local_strong,
-        "radius": radius_all,
-        "radius_robust_z": radius_z,
-        "feature_norm": norms_all,
-        "norm_robust_z": norm_z,
-        "mean_knn_distance": mean_knn_all,
-        "knn_robust_z": knn_z,
-        "knn_ratio_to_median": knn_ratio,
-        "vote_count": votes,
-        "outlier_score": score,
-        "outlier_score_percentile": pct,
-        "is_outlier": strong,
-        "nearest_normal_index": nearest_normal_idx,
-        "nearest_normal_distance": nearest_normal_distance,
-        "relative_normal_separation": relative_normal_separation,
-    })
+    metrics = pd.DataFrame(
+        {
+            "global_is_outlier": global_mask,
+            "global_iteration_found": iteration_found,
+            "global_max_abs_pc_z": global_score,
+            "global_dominant_pc": global_dom_pc,
+            "global_dominant_signed_z": global_dom_signed_z,
+            "global_detection_capped": np.full(n, bool(global_capped)),
+            "local_is_outlier": local_strong,
+            "radius": radius_all,
+            "radius_robust_z": radius_z,
+            "feature_norm": norms_all,
+            "norm_robust_z": norm_z,
+            "mean_knn_distance": mean_knn_all,
+            "knn_robust_z": knn_z,
+            "knn_ratio_to_median": knn_ratio,
+            "vote_count": votes,
+            "outlier_score": score,
+            "outlier_score_percentile": pct,
+            "is_outlier": strong,
+            "nearest_normal_index": nearest_normal_idx,
+            "nearest_normal_distance": nearest_normal_distance,
+            "relative_normal_separation": relative_normal_separation,
+        }
+    )
 
     model = OutlierModel(
         pca=pca,
@@ -1439,9 +995,7 @@ def score_new_points(x: np.ndarray, model: OutlierModel) -> pd.DataFrame:
 
     # Global robust-PCA score.
     global_coords = model.global_pca.transform(x)
-    global_signed_z = (
-        global_coords - model.global_pc_median[None, :]
-    ) / model.global_pc_scale[None, :]
+    global_signed_z = (global_coords - model.global_pc_median[None, :]) / model.global_pc_scale[None, :]
     global_abs_z = np.abs(global_signed_z)
     global_score = global_abs_z.max(axis=1)
     global_dom_pc = global_abs_z.argmax(axis=1).astype(np.int32) + 1
@@ -1479,40 +1033,41 @@ def score_new_points(x: np.ndarray, model: OutlierModel) -> pd.DataFrame:
     local_strong = (votes >= 2) | (knn_ratio >= model.hard_knn_ratio)
     strong = global_strong | local_strong
 
-    local_score = np.maximum.reduce([
-        np.maximum(radius_z, 0.0),
-        np.maximum(norm_z, 0.0),
-        np.maximum(knn_z, 0.0),
-        np.log2(np.maximum(knn_ratio, 1.0)) * 2.0,
-    ])
+    local_score = np.maximum.reduce(
+        [
+            np.maximum(radius_z, 0.0),
+            np.maximum(norm_z, 0.0),
+            np.maximum(knn_z, 0.0),
+            np.log2(np.maximum(knn_ratio, 1.0)) * 2.0,
+        ]
+    )
     score = np.maximum(local_score, global_score)
 
-    return pd.DataFrame({
-        "global_is_outlier": global_strong,
-        "global_max_abs_pc_z": global_score,
-        "global_dominant_pc": global_dom_pc,
-        "global_dominant_signed_z": global_dom_signed_z,
-        "local_is_outlier": local_strong,
-        "radius_robust_z": radius_z,
-        "norm_robust_z": norm_z,
-        "knn_robust_z": knn_z,
-        "knn_ratio_to_median": knn_ratio,
-        "vote_count": votes,
-        "outlier_score": score,
-        "is_outlier": strong,
-    })
+    return pd.DataFrame(
+        {
+            "global_is_outlier": global_strong,
+            "global_max_abs_pc_z": global_score,
+            "global_dominant_pc": global_dom_pc,
+            "global_dominant_signed_z": global_dom_signed_z,
+            "local_is_outlier": local_strong,
+            "radius_robust_z": radius_z,
+            "norm_robust_z": norm_z,
+            "knn_robust_z": knn_z,
+            "knn_ratio_to_median": knn_ratio,
+            "vote_count": votes,
+            "outlier_score": score,
+            "is_outlier": strong,
+        }
+    )
 
 
 # -----------------------------------------------------------------------------
 # Plotting / image serialization
 # -----------------------------------------------------------------------------
 
+
 def figure_to_data_uri(fig: plt.Figure, dpi: int = 140) -> str:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
-    data = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{data}"
+    return "data:image/png;base64," + figure_to_base64(fig, dpi=dpi)
 
 
 def tensor_to_data_uri(x: torch.Tensor, title: Optional[str] = None) -> str:
@@ -1543,7 +1098,7 @@ def make_pca_colored_plot(
             ax.scatter(coords[mask, 0], coords[mask, 1], s=11, alpha=0.65, label=label)
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
-    ax.set_title(f"{title}\nPC1={100*evr[0]:.2f}%, PC2={100*evr[1]:.2f}%")
+    ax.set_title(f"{title}\nPC1={100 * evr[0]:.2f}%, PC2={100 * evr[1]:.2f}%")
     ax.grid(alpha=0.25)
     ax.legend()
     fig.tight_layout()
@@ -1580,7 +1135,7 @@ def make_pca_outlier_plot(
             )
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
-    ax.set_title(f"{title}\nPC1={100*evr[0]:.2f}%, PC2={100*evr[1]:.2f}%")
+    ax.set_title(f"{title}\nPC1={100 * evr[0]:.2f}%, PC2={100 * evr[1]:.2f}%")
     ax.grid(alpha=0.25)
     ax.legend()
     fig.tight_layout()
@@ -1621,20 +1176,29 @@ def make_pca_detection_reason_plot(
     ax.scatter(coords[normal, 0], coords[normal, 1], s=8, alpha=0.24, label="normal")
     if global_pc12.any():
         ax.scatter(
-            coords[global_pc12, 0], coords[global_pc12, 1],
-            s=34, alpha=0.90, marker="o",
+            coords[global_pc12, 0],
+            coords[global_pc12, 1],
+            s=34,
+            alpha=0.90,
+            marker="o",
             label="global anomaly driven by PC1/PC2",
         )
     if global_higher.any():
         ax.scatter(
-            coords[global_higher, 0], coords[global_higher, 1],
-            s=36, alpha=0.90, marker="^",
+            coords[global_higher, 0],
+            coords[global_higher, 1],
+            s=36,
+            alpha=0.90,
+            marker="^",
             label="global anomaly driven by PC3+",
         )
     if local_only.any():
         ax.scatter(
-            coords[local_only, 0], coords[local_only, 1],
-            s=40, alpha=0.95, marker="x",
+            coords[local_only, 0],
+            coords[local_only, 1],
+            s=40,
+            alpha=0.95,
+            marker="x",
             label="local/kNN anomaly only",
         )
 
@@ -1652,9 +1216,7 @@ def make_pca_detection_reason_plot(
     ax.set_ylim(*ylim)
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
-    ax.set_title(
-        f"{title}\\nPC1={100*evr[0]:.2f}%, PC2={100*evr[1]:.2f}%"
-    )
+    ax.set_title(f"{title}\\nPC1={100 * evr[0]:.2f}%, PC2={100 * evr[1]:.2f}%")
     ax.grid(alpha=0.25)
     ax.legend()
     fig.tight_layout()
@@ -1697,10 +1259,7 @@ def make_pca_same_basis_cleaned_plot(
     ax.set_ylim(*ylim)
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
-    ax.set_title(
-        f"{title}\\n"
-        f"Original PCA basis retained; PC1={100*evr[0]:.2f}%, PC2={100*evr[1]:.2f}%"
-    )
+    ax.set_title(f"{title}\\nOriginal PCA basis retained; PC1={100 * evr[0]:.2f}%, PC2={100 * evr[1]:.2f}%")
     ax.grid(alpha=0.25)
     ax.legend()
     fig.tight_layout()
@@ -1710,7 +1269,7 @@ def make_pca_same_basis_cleaned_plot(
 def make_score_histogram(metrics: pd.DataFrame, title: str) -> str:
     fig, ax = plt.subplots(figsize=(8, 4.5))
     vals = metrics["knn_ratio_to_median"].to_numpy()
-    ax.hist(vals[np.isfinite(vals)], bins=60)
+    plot_finite_histogram(ax, vals)
     ax.axvline(1.0, linestyle="--", linewidth=1.0)
     ax.set_xlabel("Mean kNN distance / median mean kNN distance")
     ax.set_ylabel("Samples")
@@ -1735,7 +1294,7 @@ def make_global_score_histogram(
         shown = vals[vals <= upper]
     else:
         shown = vals
-    ax.hist(shown, bins=60)
+    plot_finite_histogram(ax, shown)
     ax.axvline(float(threshold), linestyle="--", linewidth=1.2)
     ax.set_xlabel("Maximum absolute robust PC z-score")
     ax.set_ylabel("Samples")
@@ -1748,6 +1307,7 @@ def make_global_score_histogram(
 # -----------------------------------------------------------------------------
 # Aggregation / report helpers
 # -----------------------------------------------------------------------------
+
 
 def aggregate_outliers(df: pd.DataFrame, is_outlier: np.ndarray, column: str) -> list[dict[str, Any]]:
     if column not in df.columns:
@@ -1764,12 +1324,14 @@ def aggregate_outliers(df: pd.DataFrame, is_outlier: np.ndarray, column: str) ->
     for idx, row in merged.iterrows():
         if int(row["outliers"]) <= 0:
             continue
-        rows.append({
-            column: str(idx),
-            "outliers": int(row["outliers"]),
-            "total": int(row["total"]),
-            "outlier_rate_pct": float(row["outlier_rate_pct"]),
-        })
+        rows.append(
+            {
+                column: str(idx),
+                "outliers": int(row["outliers"]),
+                "total": int(row["total"]),
+                "outlier_rate_pct": float(row["outlier_rate_pct"]),
+            }
+        )
     return rows
 
 
@@ -1826,8 +1388,18 @@ def stats_comparison_rows(before: dict[str, Any], after: dict[str, Any]) -> list
 
 def metadata_for_row(row: pd.Series) -> dict[str, Any]:
     cols = [
-        "id", "patient", "dataset", "machine", "machine_family", "view", "laterality",
-        "birads_numeric", "collapsed_birads", "original_birads", "birads", "original_index",
+        "id",
+        "patient",
+        "dataset",
+        "machine",
+        "machine_family",
+        "view",
+        "laterality",
+        "birads_numeric",
+        "collapsed_birads",
+        "original_birads",
+        "birads",
+        "original_index",
     ]
     out = {}
     for c in cols:
@@ -1840,6 +1412,7 @@ def metadata_for_row(row: pd.Series) -> dict[str, Any]:
 # -----------------------------------------------------------------------------
 # Main analysis of one representation
 # -----------------------------------------------------------------------------
+
 
 def analyze_space(
     name: str,
@@ -1865,16 +1438,17 @@ def analyze_space(
     after = representation_statistics(x[~out_mask]) if (~out_mask).sum() >= 3 else {}
 
     top_indices = (
-        metrics.index[out_mask]
-        .to_numpy()[np.argsort(metrics.loc[out_mask, "outlier_score"].to_numpy())[::-1]]
-        .tolist()
+        metrics.index[out_mask].to_numpy()[np.argsort(metrics.loc[out_mask, "outlier_score"].to_numpy())[::-1]].tolist()
     )
 
     before_pca_uri, before_pca_stats = make_pca_colored_plot(
         x, labels, f"{name}: PCA before outlier removal", args.seed
     )
     outlier_pca_uri = make_pca_outlier_plot(
-        x, out_mask, f"{name}: same PCA, detected outliers highlighted", args.seed,
+        x,
+        out_mask,
+        f"{name}: same PCA, detected outliers highlighted",
+        args.seed,
         annotate_indices=top_indices[: args.max_details],
     )
     reason_pca_uri = make_pca_detection_reason_plot(
@@ -1920,27 +1494,22 @@ def analyze_space(
         ),
         "global_outlier_count": int(metrics["global_is_outlier"].sum()),
         "local_outlier_count": int(metrics["local_is_outlier"].sum()),
-        "global_local_overlap_count": int(
-            (metrics["global_is_outlier"] & metrics["local_is_outlier"]).sum()
-        ),
+        "global_local_overlap_count": int((metrics["global_is_outlier"] & metrics["local_is_outlier"]).sum()),
         "global_detection_capped": bool(metrics["global_detection_capped"].iloc[0]),
         "max_global_pc_z": float(metrics["global_max_abs_pc_z"].max()),
         "global_iteration_history": global_iteration_history,
-        "global_pc12_outlier_count": int(
-            (metrics["global_is_outlier"] & (metrics["global_dominant_pc"] <= 2)).sum()
-        ),
+        "global_pc12_outlier_count": int((metrics["global_is_outlier"] & (metrics["global_dominant_pc"] <= 2)).sum()),
         "global_higher_pc_outlier_count": int(
             (metrics["global_is_outlier"] & (metrics["global_dominant_pc"] >= 3)).sum()
         ),
-        "local_only_outlier_count": int(
-            (metrics["local_is_outlier"] & ~metrics["global_is_outlier"]).sum()
-        ),
+        "local_only_outlier_count": int((metrics["local_is_outlier"] & ~metrics["global_is_outlier"]).sum()),
     }
 
 
 # -----------------------------------------------------------------------------
 # Reference-checkpoint comparison
 # -----------------------------------------------------------------------------
+
 
 def reference_comparison(
     primary_outlier_mask: np.ndarray,
@@ -1953,18 +1522,22 @@ def reference_comparison(
     primary_idx = np.where(primary_outlier_mask)[0]
     overlap = int(ref_mask[primary_idx].sum()) if len(primary_idx) else 0
 
-    ref_percentiles = ref_metrics.loc[primary_idx, "outlier_score_percentile"].to_numpy() if len(primary_idx) else np.array([])
+    ref_percentiles = (
+        ref_metrics.loc[primary_idx, "outlier_score_percentile"].to_numpy() if len(primary_idx) else np.array([])
+    )
     ref_ratios = ref_metrics.loc[primary_idx, "knn_ratio_to_median"].to_numpy() if len(primary_idx) else np.array([])
 
     details = []
     for idx in primary_top_indices:
-        details.append({
-            "index": int(idx),
-            "reference_detected_outlier": bool(ref_metrics.loc[idx, "is_outlier"]),
-            "reference_score_percentile": float(ref_metrics.loc[idx, "outlier_score_percentile"]),
-            "reference_knn_ratio": float(ref_metrics.loc[idx, "knn_ratio_to_median"]),
-            "reference_relative_normal_separation": float(ref_metrics.loc[idx, "relative_normal_separation"]),
-        })
+        details.append(
+            {
+                "index": int(idx),
+                "reference_detected_outlier": bool(ref_metrics.loc[idx, "is_outlier"]),
+                "reference_score_percentile": float(ref_metrics.loc[idx, "outlier_score_percentile"]),
+                "reference_knn_ratio": float(ref_metrics.loc[idx, "knn_ratio_to_median"]),
+                "reference_relative_normal_separation": float(ref_metrics.loc[idx, "relative_normal_separation"]),
+            }
+        )
 
     return {
         "primary_outlier_count": int(len(primary_idx)),
@@ -1973,9 +1546,7 @@ def reference_comparison(
         "median_reference_score_percentile_for_primary_outliers": (
             float(np.median(ref_percentiles)) if len(ref_percentiles) else None
         ),
-        "median_reference_knn_ratio_for_primary_outliers": (
-            float(np.median(ref_ratios)) if len(ref_ratios) else None
-        ),
+        "median_reference_knn_ratio_for_primary_outliers": (float(np.median(ref_ratios)) if len(ref_ratios) else None),
         "top_details": details,
     }
 
@@ -2014,11 +1585,10 @@ def report_space_section(space: dict[str, Any], title: str) -> str:
     n_out = space["num_outliers"]
     removed = int(space.get("removed_outliers", n_out))
     cls = "good" if n_out == 0 else "warn"
-    highlight_uri = space.get("combined_outlier_pca_uri", space["outlier_pca_uri"])
     s = [
         f"<section class='card'><h2>{html_escape(title)}</h2>",
         f"<p><span class='metric {cls}'>{n_out}</span> strong outlier(s) detected in this representation space "
-        f"({100*space['outlier_fraction']:.3f}% of analyzed samples).</p>",
+        f"({100 * space['outlier_fraction']:.3f}% of analyzed samples).</p>",
         "<p class='muted small'>Hybrid detector: (1) iterative global PCA with per-component median/MAD scaling "
         "to catch compact remote islands, plus (2) local radius / feature-norm / kNN diagnostics fitted on the "
         "dominant population to catch isolated bridge points. Final outlier = global OR local.</p>",
@@ -2060,7 +1630,9 @@ def report_space_section(space: dict[str, Any], title: str) -> str:
         ]
     else:
         if removed == 0:
-            s.append("<p class='good'>No after-PCA was needed because the final combined rule found no strong outliers.</p>")
+            s.append(
+                "<p class='good'>No after-PCA was needed because the final combined rule found no strong outliers.</p>"
+            )
         else:
             s.append("<p class='muted'>No after-PCA was produced because fewer than three normal samples remained.</p>")
     s += [
@@ -2107,16 +1679,16 @@ def build_report(
         f"<tr><th>Split</th><td>{html_escape(args.split)}</td></tr>",
         f"<tr><th>Analyzed samples</th><td>{n:,}</td></tr>",
         f"<tr><th>Combined outlier rule</th><td>{html_escape(args.outlier_space)}</td></tr>",
-        f"<tr><th>Combined detected outliers</th><td><b>{n_out}</b> ({100*n_out/max(1,n):.3f}%)</td></tr>",
+        f"<tr><th>Combined detected outliers</th><td><b>{n_out}</b> ({100 * n_out / max(1, n):.3f}%)</td></tr>",
         f"<tr><th>Detailed outliers shown</th><td>{top_n} / {n_out}</td></tr>",
         f"<tr><th>Global robust-PCA z threshold</th><td>{args.global_pca_z_threshold}</td></tr>",
         f"<tr><th>Global PCA components</th><td>{args.global_pca_components}</td></tr>",
         f"<tr><th>Global PCA max iterations</th><td>{args.global_pca_max_iterations}</td></tr>",
-        f"<tr><th>Global safety cap</th><td>{100*args.max_outlier_fraction:.2f}% of samples</td></tr>",
+        f"<tr><th>Global safety cap</th><td>{100 * args.max_outlier_fraction:.2f}% of samples</td></tr>",
         f"<tr><th>Local robust-z threshold</th><td>{args.robust_z_threshold}</td></tr>",
-        f"<tr><th>Hard kNN-ratio threshold</th><td>{args.hard_knn_ratio}× median</td></tr>",
+        f"<tr><th>Hard kNN-ratio threshold</th><td>{args.hard_knn_ratio}Ã— median</td></tr>",
         f"<tr><th>k for kNN</th><td>{args.knn_k}</td></tr>",
-        f"<tr><th>Runtime</th><td>{runtime_sec/60:.2f} min</td></tr>",
+        f"<tr><th>Runtime</th><td>{runtime_sec / 60:.2f} min</td></tr>",
         "</table>",
         "<h3>Checkpoint architecture / training metadata</h3>",
         dict_table_html([arch]),
@@ -2148,17 +1720,17 @@ def build_report(
     if reference_summary is not None:
         parts += [
             "<section class='card'><h2>Reference-checkpoint comparison</h2>",
-            f"<p>The reference checkpoint is evaluated on the <b>same image rows</b>. "
+            "<p>The reference checkpoint is evaluated on the <b>same image rows</b>. "
             "Its own deterministic evaluation preprocessing is used, matching that checkpoint's saved augmentation configuration.</p>",
             "<table>",
             f"<tr><th>Reference checkpoint</th><td>{html_escape(reference_checkpoint)}</td></tr>",
             f"<tr><th>Primary combined outliers</th><td>{reference_summary['primary_outlier_count']}</td></tr>",
             f"<tr><th>Also detected as reference outliers</th><td>{reference_summary['also_reference_outlier_count']} "
-            f"({100*reference_summary['also_reference_outlier_fraction']:.2f}%)</td></tr>",
+            f"({100 * reference_summary['also_reference_outlier_fraction']:.2f}%)</td></tr>",
             f"<tr><th>Median reference outlier-score percentile of primary outliers</th>"
             f"<td>{fmt_num(reference_summary['median_reference_score_percentile_for_primary_outliers'])}%</td></tr>",
             f"<tr><th>Median reference kNN ratio of primary outliers</th>"
-            f"<td>{fmt_num(reference_summary['median_reference_knn_ratio_for_primary_outliers'])}×</td></tr>",
+            f"<td>{fmt_num(reference_summary['median_reference_knn_ratio_for_primary_outliers'])}Ã—</td></tr>",
             "</table>",
         ]
         if reference_arch:
@@ -2180,7 +1752,7 @@ def build_report(
         "<p><b>Large change after removing all outliers:</b> the visible PCA anisotropy was substantially driven by a small pathological population.</p>",
         "<p><b>Little change after removing all outliers:</b> the representation geometry is globally anisotropic/collapsed; the outliers are more likely a symptom than the sole cause.</p>",
         "<p><b>Primary outliers become normal under the reference checkpoint:</b> evidence for model/loss-induced pathology rather than unusual raw data alone.</p>",
-        "<p><b>Only some stochastic SSL views become extreme:</b> evidence for an augmentation × model interaction. "
+        "<p><b>Only some stochastic SSL views become extreme:</b> evidence for an augmentation Ã— model interaction. "
         "If every stochastic view remains extreme, the underlying image/domain is more suspicious.</p>",
         "</section>",
         "</main></body></html>",
@@ -2192,8 +1764,11 @@ def build_report(
 # CLI / orchestration
 # -----------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="MedJEPA PCA / representation outlier analysis with self-contained HTML report.")
+    p = argparse.ArgumentParser(
+        description="MedJEPA PCA / representation outlier analysis with self-contained HTML report."
+    )
     p.add_argument("--checkpoint", required=True, type=Path)
     p.add_argument("--reference-checkpoint", default=None, type=Path)
     p.add_argument("--output-dir", default=None, type=Path)
@@ -2291,7 +1866,7 @@ def resolve_paths(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, Pa
 
 def load_analysis_df(args: argparse.Namespace, paths: dict[str, Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
     full_raw = read_csv_clean(paths["full_csv"])
-    full_df = add_metadata(prepare_labels(full_raw.reset_index(drop=False).rename(columns={"index": "original_index"})))
+    full_df = add_metadata(prepare_labels(full_raw.assign(original_index=np.arange(len(full_raw)))))
 
     if args.split == "full":
         split_df = full_df.copy()
@@ -2327,21 +1902,8 @@ def make_dataset(
     )
 
 
-def verify_bin(full_num_rows: int, bin_path: Path, arch: dict[str, Any]) -> None:
-    expected = (
-        full_num_rows
-        * int(arch["image_height"])
-        * int(arch["image_width"])
-        * np.dtype(str(arch["memmap_dtype"])).itemsize
-    )
-    actual = bin_path.stat().st_size
-    if expected != actual:
-        raise RuntimeError(
-            "Full CSV / BIN size mismatch.\n"
-            f"Expected {expected:,} bytes from {full_num_rows} rows and shape "
-            f"{arch['image_height']}x{arch['image_width']} {arch['memmap_dtype']}, "
-            f"but BIN has {actual:,} bytes."
-        )
+def verify_bin(full_num_rows, bin_path, arch):
+    validate_bin(bin_path, full_num_rows, arch["image_height"], arch["image_width"], arch["memmap_dtype"])
 
 
 def combined_outlier_mask(spaces: dict[str, dict[str, Any]], mode: str) -> np.ndarray:
@@ -2384,8 +1946,7 @@ def apply_combined_removal_to_space(
         x,
         labels,
         combined_mask,
-        f"{space['name']}: original PCA coordinates after removing ALL "
-        f"{int(combined_mask.sum())} final outliers",
+        f"{space['name']}: original PCA coordinates after removing ALL {int(combined_mask.sum())} final outliers",
         args.seed,
     )
 
@@ -2463,16 +2024,18 @@ def make_detailed_card(
         proj_scores = score_new_points(proj_np, spaces["Raw projector output"]["screen_model"])
 
         for j, view in enumerate(views):
-            aug_imgs.append(tensor_to_data_uri(view, f"SSL view {j+1}"))
-            aug_rows.append({
-                "view": j + 1,
-                "backbone_outlier": bool(emb_scores.loc[j, "is_outlier"]),
-                "backbone_global_pc_z": float(emb_scores.loc[j, "global_max_abs_pc_z"]),
-                "backbone_knn_ratio": float(emb_scores.loc[j, "knn_ratio_to_median"]),
-                "projector_outlier": bool(proj_scores.loc[j, "is_outlier"]),
-                "projector_global_pc_z": float(proj_scores.loc[j, "global_max_abs_pc_z"]),
-                "projector_knn_ratio": float(proj_scores.loc[j, "knn_ratio_to_median"]),
-            })
+            aug_imgs.append(tensor_to_data_uri(view, f"SSL view {j + 1}"))
+            aug_rows.append(
+                {
+                    "view": j + 1,
+                    "backbone_outlier": bool(emb_scores.loc[j, "is_outlier"]),
+                    "backbone_global_pc_z": float(emb_scores.loc[j, "global_max_abs_pc_z"]),
+                    "backbone_knn_ratio": float(emb_scores.loc[j, "knn_ratio_to_median"]),
+                    "projector_outlier": bool(proj_scores.loc[j, "is_outlier"]),
+                    "projector_global_pc_z": float(proj_scores.loc[j, "global_max_abs_pc_z"]),
+                    "projector_knn_ratio": float(proj_scores.loc[j, "knn_ratio_to_median"]),
+                }
+            )
 
     ref_info = {}
     if reference_spaces is not None:
@@ -2517,14 +2080,10 @@ def make_detailed_card(
         },
     ]
 
-    nn_html = (
-        f"<img class='mammo' src='{nn_uri}'>"
-        if nn_uri
-        else "<p>No normal neighbour available.</p>"
-    )
+    nn_html = f"<img class='mammo' src='{nn_uri}'>" if nn_uri else "<p>No normal neighbour available.</p>"
 
     card = [
-        f"<article class='card outlier-card'><h3>#{rank} — combined score {combined_score[idx]:.2f}</h3>",
+        f"<article class='card outlier-card'><h3>#{rank} â€” combined score {combined_score[idx]:.2f}</h3>",
         "<div class='grid3'>",
         f"<div><img class='mammo' src='{raw_uri}'></div>",
         f"<div><img class='mammo' src='{proc_uri}'></div>",
@@ -2625,9 +2184,7 @@ def main() -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device(
-        args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
-    )
+    device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(device)}")
@@ -2674,7 +2231,9 @@ def main() -> None:
     )
 
     combined_idx = np.where(combined_mask)[0]
-    top_combined_indices = combined_idx[np.argsort(combined_score[combined_idx])[::-1]].tolist() if len(combined_idx) else []
+    top_combined_indices = (
+        combined_idx[np.argsort(combined_score[combined_idx])[::-1]].tolist() if len(combined_idx) else []
+    )
 
     # Crucial: the before/after comparison removes the FINAL combined set all at once,
     # rather than removing a different set separately for backbone/projector analyses.
@@ -2715,6 +2274,7 @@ def main() -> None:
             "backbone_name",
             "image_size",
             "backbone_output_dim",
+            "backbone_num_classes",
         ]
         backbone_differences = {
             k: (arch.get(k), reference_arch.get(k))
@@ -2768,12 +2328,8 @@ def main() -> None:
             "Reference checkpoint",
         )
         reference_spaces = {
-            "Backbone embedding": analyze_space(
-                "Reference backbone embedding", ref_emb, labels, args
-            ),
-            "Raw projector output": analyze_space(
-                "Reference raw projector output", ref_proj, labels, args
-            ),
+            "Backbone embedding": analyze_space("Reference backbone embedding", ref_emb, labels, args),
+            "Raw projector output": analyze_space("Reference raw projector output", ref_proj, labels, args),
         }
         ref_combined = combined_outlier_mask(reference_spaces, args.outlier_space)
 
@@ -2813,10 +2369,9 @@ def main() -> None:
             torch.cuda.empty_cache()
 
         # Detailed cards below need the primary checkpoint again.
-        if (
-            int(reference_arch["projector_hidden_dim"]) != int(arch["projector_hidden_dim"])
-            or int(reference_arch["projection_dim"]) != int(arch["projection_dim"])
-        ):
+        if int(reference_arch["projector_hidden_dim"]) != int(arch["projector_hidden_dim"]) or int(
+            reference_arch["projection_dim"]
+        ) != int(arch["projection_dim"]):
             rebuild_projector_in_place(model, arch, device)
 
         load_weights_into_existing_model(model, payload, "Primary restore")
@@ -2920,10 +2475,7 @@ def main() -> None:
     print(f"  Summary: {output_dir / 'analysis_summary.json'}")
     if detailed_records:
         print(f"  Top-N:   {output_dir / 'top_outliers.csv'}")
-    print(
-        f"  Combined outliers: {int(combined_mask.sum())}/{len(combined_mask)} "
-        f"({100*combined_mask.mean():.3f}%)"
-    )
+    print(f"  Combined outliers: {int(combined_mask.sum())}/{len(combined_mask)} ({100 * combined_mask.mean():.3f}%)")
     if int(combined_mask.sum()) == 0:
         print("  No strong outliers found; reference/detailed stages were skipped as intended.")
 
