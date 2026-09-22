@@ -135,7 +135,14 @@ The four original standalone implementations were replaced as follows:
 | `create_medjepa_pca_report.py` | `analyze_medjepa.py`, with PCA enabled |
 | `run_jepa_transfer_label_efficiency_v2.py` | `run_transfer_experiment.py` |
 
-The initial source snapshot is Git commit `463d46b`. The three additional supervised scripts are migrated as described above. Remaining top-level experiments, the notebook and `old/` retain their standalone implementations.
+The initial source snapshot is Git commit `463d46b`. The supervised, dataset and analysis scripts now reuse `core/`. Historical files in `old/` retain their standalone implementations.
+
+`notebooks/visualize_mg_lejepa_aug_v2.ipynb` imports the training augmentation implementation from `core/transforms.py`, plus shared labels, row mapping and image reading. Start Jupyter from this directory or `notebooks/`, with `core/` available beside `notebooks/`. Edit the notebook's cluster paths before running it; its selected augmentation JSON determines the policy despite the retained v2 filename. The notebook keeps its existing display categories and sampling controls.
+
+The two auxiliary scripts remain at the root:
+
+- `plot_medjepa_training_history.py` retains its CLI, JSON-read retries and watch mode, but calls shared training-history plotting. Training and this command write the same seven plot files, with atomic replacement and support for partial histories.
+- `run_medjepa_representation_comparison.py` shares encoder construction, checkpoint hints, labels, image reading and deterministic preprocessing. Its CLS/patch-token extraction, probe protocols, composite-key row matching and report layout remain local. Its existing metadata category conventions are retained. Checkpoints now load strictly and support headless encoders; the historical `head512` result key denotes the backbone output even when its dimension differs from 512. Normalization must be `uint16` or `per_image_percentile`, matching core; invalid modes now fail instead of silently using per-image maximum scaling.
 
 The training objective, tensor layout, schedules and transfer subset strategies are retained. Transfer also retains model reuse between runs and nonpersistent workers. With multiple seed repetitions in one process, initial model weights are shared, as before; use separate processes with different seeds for independent initializations.
 
@@ -155,7 +162,7 @@ Upload the entry points, **entire `core/`, `supervised/`, `dataset/` and `analys
 ```bash
 python -m pip install -e ".[test,opencv]"
 python -m pytest -q
-python -m ruff check core supervised dataset analysis tests train_medjepa.py analyze_medjepa.py run_transfer_experiment.py
+python -m ruff check core supervised dataset analysis tests train_medjepa.py analyze_medjepa.py run_transfer_experiment.py plot_medjepa_training_history.py run_medjepa_representation_comparison.py
 ```
 
 Keep the cluster's working PyTorch/torchvision/CUDA combination. The local `.venv/` is ignored by Git and uses CPU PyTorch for verification; it should not be uploaded as the cluster environment. OpenCV is required for resizing in the two supervised sweeps. It also affects connected-component corner-mask behavior and CLAHE; use the same OpenCV availability when comparing runs.

@@ -1,6 +1,8 @@
 """Stateless plotting functions used by training and experiment reports."""
 
 from __future__ import annotations
+import math
+import os
 import base64
 import io
 from typing import Any
@@ -29,17 +31,84 @@ def plot_history_grid(history, keys, epochs, shape, figsize, path):
     plt.close(figure)
 
 
-def plot_training_history(history: dict[str, list[float]], dirs: dict[str, Path]) -> None:
-    epochs = np.arange(1, len(history["lejepa"]) + 1)
-    plot_history_grid(
-        history,
-        ["lejepa", "invariance", "sigreg", "lr"],
-        epochs,
-        (1, 4),
-        (16, 4),
-        dirs["plots"] / "training_history.png",
-    )
+def as_float_array(values: Any) -> np.ndarray:
+    if not isinstance(values, list):
+        return np.asarray([], dtype=float)
+    out: list[float] = []
+    for value in values:
+        try:
+            x = float(value)
+        except Exception:
+            x = math.nan
+        out.append(x)
+    return np.asarray(out, dtype=float)
 
+
+def history_len(history: dict[str, Any]) -> int:
+    if "lejepa" in history and isinstance(history["lejepa"], list):
+        return len(history["lejepa"])
+    lengths = [len(v) for v in history.values() if isinstance(v, list)]
+    return max(lengths) if lengths else 0
+
+
+def plot_series(ax: plt.Axes, epochs: np.ndarray, history: dict[str, Any], key: str, label: str | None = None) -> bool:
+    y = as_float_array(history.get(key, []))
+    if len(y) == 0:
+        return False
+    n = min(len(epochs), len(y))
+    if n == 0:
+        return False
+    ax.plot(epochs[:n], y[:n], label=label or key)
+    return True
+
+
+def savefig_atomic(path: Path, dpi: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Keep the final image extension as the actual suffix so that matplotlib
+    # can infer/write the correct file format. For example, use
+    # training_history.tmp.png instead of training_history.png.tmp.
+    suffix = path.suffix.lstrip(".")
+    tmp = path.with_name(path.stem + ".tmp" + path.suffix)
+
+    plt.savefig(tmp, dpi=dpi, format=suffix, bbox_inches="tight")
+    os.replace(tmp, path)
+
+
+def plot_training_history(history: dict[str, Any], output_dir: Path | dict[str, Path], dpi: int = 200) -> None:
+    # Training passes its output-directory mapping; the CLI passes a path.
+    output_dir = Path(output_dir["plots"] if isinstance(output_dir, dict) else output_dir)
+    n_epochs = history_len(history)
+    if n_epochs == 0:
+        raise ValueError("No epoch history found. Is training_history.json still empty?")
+    epochs = np.arange(1, n_epochs + 1)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Main objective history.
+    plt.figure(figsize=(16, 4))
+    for i, key in enumerate(["lejepa", "invariance", "sigreg", "lr"]):
+        ax = plt.subplot(1, 4, i + 1)
+        plot_series(ax, epochs, history, key)
+        ax.set_title(key)
+        ax.set_xlabel("Epoch")
+        ax.grid(alpha=0.3)
+    plt.tight_layout()
+    savefig_atomic(output_dir / "training_history.png", dpi=dpi)
+    plt.close()
+
+    # 2) Collapse diagnostics in one compact 2x3 grid.
+    plt.figure(figsize=(15, 8))
+    for i, key in enumerate(["lejepa", "invariance", "sigreg", "raw_proj_std", "loss_proj_std", "emb_std"]):
+        ax = plt.subplot(2, 3, i + 1)
+        plot_series(ax, epochs, history, key)
+        ax.set_title(key)
+        ax.set_xlabel("Epoch")
+        ax.grid(alpha=0.3)
+    plt.tight_layout()
+    savefig_atomic(output_dir / "collapse_diagnostics.png", dpi=dpi)
+    plt.close()
+
+    # 3) Projection/embedding diagnostics.
     plt.figure(figsize=(15, 8))
     diag_groups = [
         ("standard deviation", ["raw_proj_std", "loss_proj_std", "emb_std"]),
@@ -48,37 +117,32 @@ def plot_training_history(history: dict[str, list[float]], dirs: dict[str, Path]
     ]
     for row, (title, keys) in enumerate(diag_groups):
         ax = plt.subplot(3, 1, row + 1)
+        any_line = False
         for key in keys:
-            if key in history and len(history[key]) == len(epochs):
-                ax.plot(epochs, history[key], label=key)
+            any_line = plot_series(ax, epochs, history, key) or any_line
         ax.set_title(title)
         ax.set_xlabel("Epoch")
         ax.grid(alpha=0.3)
-        ax.legend(fontsize=8)
+        if any_line:
+            ax.legend(fontsize=8)
     plt.tight_layout()
-    plt.savefig(dirs["plots"] / "training_diagnostics.png", dpi=200)
-    plt.savefig(dirs["plots"] / "projection_embedding_diagnostics.png", dpi=200)
+    savefig_atomic(output_dir / "training_diagnostics.png", dpi=dpi)
+    savefig_atomic(output_dir / "projection_embedding_diagnostics.png", dpi=dpi)
     plt.close()
 
-    plot_history_grid(
-        history,
-        ["lejepa", "invariance", "sigreg", "raw_proj_std", "loss_proj_std", "emb_std"],
-        epochs,
-        (2, 3),
-        (14, 8),
-        dirs["plots"] / "collapse_diagnostics.png",
-    )
-
-    plt.figure(figsize=(6, 4))
-    plt.plot(epochs, history.get("epoch_time_sec", []))
-    plt.title("epoch_time_sec")
-    plt.xlabel("Epoch")
-    plt.ylabel("Seconds")
-    plt.grid(alpha=0.3)
+    # 4) Epoch time.
+    plt.figure(figsize=(8, 5))
+    ax = plt.gca()
+    plot_series(ax, epochs, history, "epoch_time_sec")
+    ax.set_title("epoch_time_sec")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Seconds")
+    ax.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(dirs["plots"] / "epoch_times.png", dpi=200)
+    savefig_atomic(output_dir / "epoch_times.png", dpi=dpi)
     plt.close()
 
+    # 5) Timing components.
     timing_keys = [
         "data_wait_and_augmentation_time_sec",
         "h2d_transfer_time_sec",
@@ -87,18 +151,21 @@ def plot_training_history(history: dict[str, list[float]], dirs: dict[str, Path]
         "metrics_bookkeeping_time_sec",
     ]
     plt.figure(figsize=(10, 5))
+    ax = plt.gca()
+    any_line = False
     for key in timing_keys:
-        if key in history:
-            plt.plot(epochs, history[key], label=key.replace("_time_sec", ""))
-    plt.title("Epoch timing components")
-    plt.xlabel("Epoch")
-    plt.ylabel("Seconds")
-    plt.legend(fontsize=8)
-    plt.grid(alpha=0.3)
+        any_line = plot_series(ax, epochs, history, key, label=key.replace("_time_sec", "")) or any_line
+    ax.set_title("Epoch timing components")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Seconds")
+    ax.grid(alpha=0.3)
+    if any_line:
+        ax.legend(fontsize=8)
     plt.tight_layout()
-    plt.savefig(dirs["plots"] / "epoch_timing_components.png", dpi=200)
+    savefig_atomic(output_dir / "epoch_timing_components.png", dpi=dpi)
     plt.close()
 
+    # 6) Timing fractions.
     fraction_keys = [
         "data_wait_and_augmentation_fraction",
         "h2d_transfer_fraction",
@@ -107,16 +174,18 @@ def plot_training_history(history: dict[str, list[float]], dirs: dict[str, Path]
         "metrics_bookkeeping_fraction",
     ]
     plt.figure(figsize=(10, 5))
+    ax = plt.gca()
+    any_line = False
     for key in fraction_keys:
-        if key in history:
-            plt.plot(epochs, history[key], label=key.replace("_fraction", ""))
-    plt.title("Epoch timing fractions")
-    plt.xlabel("Epoch")
-    plt.ylabel("Fraction of epoch wall time")
-    plt.legend(fontsize=8)
-    plt.grid(alpha=0.3)
+        any_line = plot_series(ax, epochs, history, key, label=key.replace("_fraction", "")) or any_line
+    ax.set_title("Epoch timing fractions")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Fraction of epoch wall time")
+    ax.grid(alpha=0.3)
+    if any_line:
+        ax.legend(fontsize=8)
     plt.tight_layout()
-    plt.savefig(dirs["plots"] / "epoch_timing_fractions.png", dpi=200)
+    savefig_atomic(output_dir / "epoch_timing_fractions.png", dpi=dpi)
     plt.close()
 
 

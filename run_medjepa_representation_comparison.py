@@ -26,14 +26,22 @@ Important notes:
 
 from __future__ import annotations
 
+from core.config import deep_get, save_json
+from core.data import (
+    MammographyDataset,
+    prepare_labels,
+    read_csv_clean,
+    set_seed,
+    _normalize_view,
+    _normalize_laterality,
+)
+from core.models import ViTEncoder, model_hints, read_checkpoint, strip_module_prefix
+from core.transforms import ConfigurableMGAugmentation
+
 import argparse
 import copy
 import datetime as _dt
 import json
-import math
-import os
-import random
-import sys
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -43,9 +51,9 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
@@ -55,20 +63,14 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, confusion_matrix, classification_report
 
 from torch.amp import autocast
-from torch.utils.data import DataLoader, Dataset, TensorDataset
-from torchvision.transforms import InterpolationMode
-import torchvision.transforms.functional as TF
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
-
-try:
-    import timm
-except ImportError as exc:
-    raise ImportError("Missing dependency: timm. Install with: pip install timm") from exc
 
 
 # -----------------------------------------------------------------------------
 # Config / CLI
 # -----------------------------------------------------------------------------
+
 
 @dataclass
 class ModelConfig:
@@ -80,6 +82,7 @@ class ModelConfig:
     percentile_low: float = 1.0
     percentile_high: float = 99.0
     backbone_name: str = "vit_small_patch8_224"
+    backbone_num_classes: int = 512
     backbone_output_dim: int = 512
     projection_dim: int = 16
     projector_hidden_dim: int = 2048
@@ -129,65 +132,13 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
-
-
-def save_json(obj: Any, path: str | Path) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, default=str)
-
-
-def deep_get(dct: dict[str, Any], keys: list[str], default: Any) -> Any:
-    cur: Any = dct
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
-
-
 # -----------------------------------------------------------------------------
 # Checkpoint/model
 # -----------------------------------------------------------------------------
 
-class MedJEPAEncoder(nn.Module):
+
+class MedJEPAEncoder(ViTEncoder):
     """Compatible with train_medjepa_mg_v5/v6 checkpoints."""
-
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        self.cfg = cfg
-        self.backbone = timm.create_model(
-            cfg.backbone_name,
-            pretrained=False,
-            num_classes=cfg.backbone_output_dim,
-            drop_path_rate=cfg.drop_path_rate,
-            img_size=cfg.image_size,
-            in_chans=1,
-        )
-        self.proj = nn.Sequential(
-            nn.Linear(cfg.backbone_output_dim, cfg.projector_hidden_dim),
-            nn.BatchNorm1d(cfg.projector_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(cfg.projector_hidden_dim, cfg.projector_hidden_dim),
-            nn.BatchNorm1d(cfg.projector_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(cfg.projector_hidden_dim, cfg.projection_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Training-style forward for x [B,V,1,H,W].
-        b, v = x.shape[:2]
-        flat = x.flatten(0, 1)
-        emb = self.backbone(flat)
-        proj = self.proj(emb).reshape(b, v, -1)
-        return emb, proj
 
     def forward_head512(self, x: torch.Tensor) -> torch.Tensor:
         # x [B,1,H,W]
@@ -217,14 +168,10 @@ class MedJEPAEncoder(nn.Module):
         return cls, patches
 
 
-def strip_module_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    if state_dict and all(k.startswith("module.") for k in state_dict.keys()):
-        return {k[len("module."):]: v for k, v in state_dict.items()}
-    return state_dict
-
-
-def load_checkpoint_and_model(path: str | Path, device: torch.device) -> tuple[MedJEPAEncoder, dict[str, Any], dict[str, Any], ModelConfig]:
-    ckpt = torch.load(path, map_location="cpu")
+def load_checkpoint_and_model(
+    path: str | Path, device: torch.device
+) -> tuple[MedJEPAEncoder, dict[str, Any], dict[str, Any], ModelConfig]:
+    ckpt = read_checkpoint(path)
     if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt:
         raise ValueError("Checkpoint must be a dict containing model_state_dict.")
     raw_cfg = ckpt.get("config", {}) or {}
@@ -246,13 +193,14 @@ def load_checkpoint_and_model(path: str | Path, device: torch.device) -> tuple[M
         projector_hidden_dim=int(raw_cfg.get("projector_hidden_dim", 2048)),
         drop_path_rate=float(raw_cfg.get("drop_path_rate", 0.1)),
     )
+    # Infer the backbone head dimensions from weights, including headless runs.
+    hints = model_hints(ckpt)
+    for name in ("backbone_num_classes", "backbone_output_dim", "image_size"):
+        if name in hints:
+            setattr(cfg, name, int(hints[name]))
     model = MedJEPAEncoder(cfg)
-    state = strip_module_prefix(ckpt["model_state_dict"])
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        print("WARNING: non-strict checkpoint load", flush=True)
-        print("  Missing keys:", missing[:20], "..." if len(missing) > 20 else "", flush=True)
-        print("  Unexpected keys:", unexpected[:20], "..." if len(unexpected) > 20 else "", flush=True)
+    state = {strip_module_prefix(key): value for key, value in ckpt["model_state_dict"].items()}
+    model.load_state_dict(state, strict=True)
     model.to(device)
     model.eval()
     for p in model.parameters():
@@ -263,50 +211,6 @@ def load_checkpoint_and_model(path: str | Path, device: torch.device) -> tuple[M
 # -----------------------------------------------------------------------------
 # CSV / metadata
 # -----------------------------------------------------------------------------
-
-def normalize_birads_value(x: Any) -> float:
-    if pd.isna(x):
-        return np.nan
-    s = str(x).strip().lower()
-    for k in ["1", "2", "3", "4", "5"]:
-        if s == k or s.startswith(k + ".") or s.startswith(k + " ") or f"({k})" in s:
-            return int(k)
-    try:
-        return int(float(s))
-    except Exception:
-        return np.nan
-
-
-def collapse_birads_numeric(x: float) -> str:
-    if pd.isna(x):
-        return "unknown"
-    x = int(x)
-    if x in (1, 2):
-        return "routine"
-    if x == 3:
-        return "follow_up"
-    if x in (4, 5):
-        return "biopsy"
-    return "unknown"
-
-
-def read_csv_clean(path: str | Path) -> pd.DataFrame:
-    df = pd.read_csv(path, low_memory=False)
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
-
-def prepare_labels(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    label_col = "original_birads" if "original_birads" in df.columns else "birads"
-    if label_col not in df.columns:
-        raise ValueError("CSV must contain original_birads or birads.")
-    df["birads_numeric"] = df[label_col].apply(normalize_birads_value)
-    df = df[df["birads_numeric"].isin([1, 2, 3, 4, 5])].copy()
-    df["birads_numeric"] = df["birads_numeric"].astype(int)
-    df["collapsed_birads"] = df["birads_numeric"].apply(collapse_birads_numeric)
-    df["target_collapsed"] = df["collapsed_birads"].map({"routine": 0, "follow_up": 1, "biopsy": 2}).astype(int)
-    return df
 
 
 def _safe_json_loads(x: Any) -> dict[str, Any]:
@@ -322,37 +226,6 @@ def _safe_json_loads(x: Any) -> dict[str, Any]:
         return obj if isinstance(obj, dict) else {}
     except Exception:
         return {}
-
-
-def _metadata_deep_get(dct: dict[str, Any], keys: list[str], default: Any = "unknown") -> Any:
-    cur: Any = dct
-    for key in keys:
-        if not isinstance(cur, dict) or key not in cur:
-            return default
-        cur = cur[key]
-    return cur
-
-
-def _normalize_view(x: Any) -> str:
-    s = str(x).strip().lower()
-    if not s or s in {"nan", "none", "unknown", "missing"}:
-        return "unknown"
-    if s in {"mlo", "mediolateral oblique", "medio-lateral oblique"} or "mediolateral" in s or "oblique" in s:
-        return "MLO"
-    if s in {"cc", "cranial caudal", "craniocaudal", "cranio-caudal"} or "cranial" in s or "caudal" in s:
-        return "CC"
-    return s
-
-
-def _normalize_laterality(x: Any) -> str:
-    s = str(x).strip().lower()
-    if s in {"left", "l"}:
-        return "left"
-    if s in {"right", "r"}:
-        return "right"
-    if not s or s in {"nan", "none", "unknown", "missing"}:
-        return "unknown"
-    return s
 
 
 def _machine_family(x: Any) -> str:
@@ -376,18 +249,22 @@ def add_derived_metadata(df: pd.DataFrame) -> pd.DataFrame:
     if "context" in df.columns:
         parsed = df["context"].apply(_safe_json_loads)
         if "view" not in df.columns:
-            df["view"] = parsed.apply(lambda d: _normalize_view(_metadata_deep_get(d, ["exam", "view"], "unknown")))
+            df["view"] = parsed.apply(lambda d: _normalize_view(deep_get(d, ["exam", "view"], "unknown")))
         else:
             df["view"] = df["view"].apply(_normalize_view)
         if "laterality" not in df.columns:
-            df["laterality"] = parsed.apply(lambda d: _normalize_laterality(_metadata_deep_get(d, ["exam", "laterality"], "unknown")))
+            df["laterality"] = parsed.apply(
+                lambda d: _normalize_laterality(deep_get(d, ["exam", "laterality"], "unknown"))
+            )
         else:
             df["laterality"] = df["laterality"].apply(_normalize_laterality)
     else:
         df["view"] = df.get("view", "unknown")
         df["view"] = df["view"].apply(_normalize_view) if isinstance(df["view"], pd.Series) else "unknown"
         df["laterality"] = df.get("laterality", "unknown")
-        df["laterality"] = df["laterality"].apply(_normalize_laterality) if isinstance(df["laterality"], pd.Series) else "unknown"
+        df["laterality"] = (
+            df["laterality"].apply(_normalize_laterality) if isinstance(df["laterality"], pd.Series) else "unknown"
+        )
 
     if "machine" in df.columns:
         df["machine_family"] = df["machine"].apply(_machine_family)
@@ -398,25 +275,28 @@ def add_derived_metadata(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _string_key_frame(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    out = pd.DataFrame(index=df.index)
-    for c in cols:
-        out[c] = df[c].astype(str).fillna("<NA>")
-    return out
-
-
 def ensure_original_index(split_df: pd.DataFrame, full_df_raw: pd.DataFrame, split_name: str) -> pd.DataFrame:
     split_df = split_df.copy()
     if "original_index" in split_df.columns:
         split_df["original_index"] = split_df["original_index"].astype(int)
         return split_df
 
-    full = full_df_raw.reset_index(drop=False).rename(columns={"index": "original_index"}).copy()
+    full = full_df_raw.copy()
+    full["original_index"] = np.arange(len(full))
 
     # Prefer a rich composite key because full MG CSV may contain duplicated ids.
     preferred_cols = [
-        "id", "patient", "dataset", "modality", "machine", "exam", "segmentation",
-        "context", "findings", "original_birads", "birads",
+        "id",
+        "patient",
+        "dataset",
+        "modality",
+        "machine",
+        "exam",
+        "segmentation",
+        "context",
+        "findings",
+        "original_birads",
+        "birads",
     ]
     cols = [c for c in preferred_cols if c in split_df.columns and c in full.columns]
     if not cols:
@@ -489,117 +369,25 @@ def balanced_sample_df(df: pd.DataFrame, label_col: str, max_total: int, seed: i
 # Deterministic MG evaluation dataset/transform
 # -----------------------------------------------------------------------------
 
-class EvalMGTransform(nn.Module):
-    def __init__(self, aug_cfg: dict[str, Any], image_size: int):
-        super().__init__()
-        self.aug_cfg = aug_cfg or {}
-        self.image_size = int(image_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self._foreground_crop(x)
-        x = self._mask_top_corner(x)
-        x = TF.resize(x, [self.image_size, self.image_size], interpolation=InterpolationMode.BILINEAR, antialias=True)
-        return x.clamp(0, 1)
+class MGEvalDataset(MammographyDataset):
+    """Shared image reading with the experiment's (image, label, row) batches."""
 
-    def _foreground_crop(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.aug_cfg, ["preprocessing", "foreground_crop"], {})
-        if not isinstance(c, dict) or not c.get("enabled", False):
-            return x
-        threshold = float(c.get("threshold_abs", 1e-6))
-        margin_frac = float(c.get("margin_frac", 0.05))
-        min_area_frac = float(c.get("min_foreground_area_frac", 0.01))
-        fallback = bool(c.get("fallback_to_original", True))
-        mask = x[0] > threshold
-        ys, xs = torch.where(mask)
-        h, w = x.shape[-2:]
-        if len(xs) < int(h * w * min_area_frac):
-            return x if fallback else x[:, :h, :w]
-        y0, y1 = int(ys.min()), int(ys.max()) + 1
-        x0, x1 = int(xs.min()), int(xs.max()) + 1
-        mh, mw = int((y1 - y0) * margin_frac), int((x1 - x0) * margin_frac)
-        return x[:, max(0, y0 - mh):min(h, y1 + mh), max(0, x0 - mw):min(w, x1 + mw)]
+    def __init__(self, df, bin_path, full_num_rows, cfg, aug_cfg):
+        super().__init__(
+            df,
+            bin_path,
+            full_num_rows,
+            (cfg.image_height, cfg.image_width),
+            cfg.memmap_dtype,
+            ConfigurableMGAugmentation(aug_cfg, cfg.image_size, train=False),
+            cfg.normalize_mode,
+            cfg.percentile_low,
+            cfg.percentile_high,
+        )
 
-    def _mask_top_corner(self, x: torch.Tensor) -> torch.Tensor:
-        c = deep_get(self.aug_cfg, ["preprocessing", "top_right_corner_mask"], {})
-        if not isinstance(c, dict) or not c.get("enabled", False):
-            return x
-        frac_x = float(c.get("frac_x", 0.30))
-        frac_y = float(c.get("frac_y", 0.12))
-        value = float(c.get("value", 0.0))
-        foreground_threshold = float(c.get("foreground_threshold", 1e-4))
-        min_component_area_frac = float(c.get("min_component_area_frac", 0.0002))
-        skip_if_single_component = bool(c.get("skip_if_single_component", True))
-
-        _, h, w = x.shape
-        mh = max(1, int(round(h * frac_y)))
-        mw = max(1, int(round(w * frac_x)))
-        foreground = x[0] > foreground_threshold
-
-        if skip_if_single_component:
-            try:
-                import cv2  # type: ignore
-                mask_np = foreground.detach().cpu().numpy().astype("uint8")
-                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_np, connectivity=8)
-                min_area = max(1, int(round(h * w * min_component_area_frac)))
-                relevant = 0
-                for label_idx in range(1, num_labels):
-                    if int(stats[label_idx, cv2.CC_STAT_AREA]) >= min_area:
-                        relevant += 1
-                if relevant <= 1:
-                    return x
-            except Exception:
-                pass
-
-        left_foreground = foreground[:, : w // 2].float().sum().item()
-        right_foreground = foreground[:, w // 2 :].float().sum().item()
-        x = x.clone()
-        if left_foreground <= right_foreground:
-            x[:, :mh, :mw] = value
-        else:
-            x[:, :mh, w - mw:] = value
-        return x
-
-
-class MGEvalDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, bin_path: str | Path, full_num_rows: int, cfg: ModelConfig, aug_cfg: dict[str, Any]):
-        self.df = df.reset_index(drop=True).copy()
-        self.bin_path = Path(bin_path)
-        self.full_num_rows = int(full_num_rows)
-        self.image_shape = (int(cfg.image_height), int(cfg.image_width))
-        self.dtype = np.dtype(cfg.memmap_dtype)
-        self.normalize_mode = cfg.normalize_mode
-        self.percentile_low = float(cfg.percentile_low)
-        self.percentile_high = float(cfg.percentile_high)
-        self.transform = EvalMGTransform(aug_cfg, cfg.image_size)
-        self._imgs: np.memmap | None = None
-        if "original_index" not in self.df.columns:
-            raise ValueError("df needs original_index")
-
-    def __len__(self) -> int:
-        return len(self.df)
-
-    def _open(self) -> np.memmap:
-        if self._imgs is None:
-            self._imgs = np.memmap(self.bin_path, dtype=self.dtype, mode="r", shape=(self.full_num_rows, *self.image_shape))
-        return self._imgs
-
-    def _load_tensor(self, original_index: int) -> torch.Tensor:
-        arr = self._open()[int(original_index)].astype(np.float32)
-        if self.normalize_mode == "uint16":
-            arr = arr / 65535.0 if self.dtype == np.dtype("uint16") else arr / max(float(arr.max()), 1.0)
-        elif self.normalize_mode == "per_image_percentile":
-            lo, hi = np.percentile(arr, [self.percentile_low, self.percentile_high])
-            arr = np.zeros_like(arr, dtype=np.float32) if hi <= lo else np.clip((arr - lo) / (hi - lo), 0, 1)
-        else:
-            arr = arr / max(float(arr.max()), 1.0)
-        x = torch.from_numpy(arr).unsqueeze(0).float().clamp(0, 1)
-        return self.transform(x)
-
-    def __getitem__(self, idx: int):
-        row = self.df.iloc[idx]
-        x = self._load_tensor(int(row["original_index"]))
-        y = int(row["target_collapsed"])
-        return x, y, idx
+    def __getitem__(self, idx):
+        return self.transform(self.image_at(idx)), int(self.df.iloc[idx]["target_collapsed"]), idx
 
 
 def make_loader(df: pd.DataFrame, bin_path: str | Path, full_num_rows: int, cfg: ModelConfig, aug_cfg: dict[str, Any],
@@ -615,6 +403,7 @@ def make_loader(df: pd.DataFrame, bin_path: str | Path, full_num_rows: int, cfg:
 # -----------------------------------------------------------------------------
 # Feature extraction
 # -----------------------------------------------------------------------------
+
 
 @torch.inference_mode()
 def extract_features(model: MedJEPAEncoder, loader: DataLoader, device: torch.device, representation: str, use_amp: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -660,6 +449,7 @@ def extract_patch_pooled(model: MedJEPAEncoder, downstream: nn.Module, loader: D
 # -----------------------------------------------------------------------------
 # Probes on precomputed features
 # -----------------------------------------------------------------------------
+
 
 class TabularProbe(nn.Module):
     def __init__(self, dim: int, num_classes: int = 3, kind: str = "linear", hidden_dim: int = 256, dropout: float = 0.1):
@@ -769,6 +559,7 @@ def train_tabular_probe(
 # -----------------------------------------------------------------------------
 # Patch-token cross-attention downstream heads
 # -----------------------------------------------------------------------------
+
 
 class CrossAttentionPool(nn.Module):
     def __init__(self, dim: int, num_queries: int = 1, num_heads: int = 4):
@@ -1060,7 +851,7 @@ def create_pdf_report(
             f"Backbone: {cfg.backbone_name}",
             f"Image size: {cfg.image_size}",
             f"Current head embedding dimension: {cfg.backbone_output_dim}",
-            f"Raw token dimension inferred from model during extraction (see JSON for exact feature dims).",
+            "Raw token dimension inferred from model during extraction (see JSON for exact feature dims).",
             "",
             "Representations:",
             "  head512: timm-head output used by previous PCA/linear probes.",
@@ -1077,7 +868,7 @@ def create_pdf_report(
             f"PCA collapsed counts: {pca_df['collapsed_birads'].value_counts().to_dict()}",
             f"PCA view counts: {pca_df['view'].value_counts().to_dict()}",
             f"PCA machine family counts: {pca_df['machine_family'].value_counts().to_dict()}",
-            f"Elapsed wall time: {elapsed_sec/60:.1f} min",
+            f"Elapsed wall time: {elapsed_sec / 60:.1f} min",
         ]
         add_text_page(pdf, "MedJEPA representation comparison report", lines)
         add_metrics_table_page(pdf, metrics)
@@ -1089,6 +880,7 @@ def create_pdf_report(
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
+
 
 def main() -> None:
     args = parse_args()
