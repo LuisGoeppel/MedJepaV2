@@ -280,3 +280,18 @@ def load_encoder(
     state = {strip_module_prefix(str(key)): value for key, value in payload["model_state_dict"].items()}
     model.load_state_dict(state, strict=True)
     return model.to(device).eval(), cfg, payload["augmentation_config"]
+
+
+def build_supervised_model(backbone, image_size, pretrained=False, num_classes=3, **kwargs):
+    """Create one-channel timm classifiers; CNNs do not take img_size."""
+    options = dict(pretrained=pretrained, num_classes=num_classes, in_chans=1, **kwargs)
+    try:
+        return timm.create_model(backbone, img_size=image_size, **options)
+    except TypeError as exc:
+        if "img_size" not in str(exc):
+            raise
+        return timm.create_model(backbone, **options)
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model

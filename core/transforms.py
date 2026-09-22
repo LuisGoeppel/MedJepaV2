@@ -384,3 +384,31 @@ def make_supervised_transform(aug_cfg: dict[str, Any], cfg: ExperimentConfig, tr
 
 def evaluation_transform(aug_cfg: dict[str, Any], image_size: int) -> nn.Module:
     return ConfigurableMGAugmentation(aug_cfg, image_size, train=False)
+
+
+class BaselineTransform(nn.Module):
+    """Flip then resize, retaining the historical baseline interpolation choices."""
+
+    def __init__(self, image_size, hflip_p=0.0, interpolation="bilinear"):
+        super().__init__()
+        self.image_size = int(image_size)
+        self.hflip_p = float(hflip_p)
+        self.interpolation = interpolation
+
+    def forward(self, x):
+        if self.hflip_p > 0 and random.random() < self.hflip_p:
+            x = torch.flip(x, dims=[2])
+        if self.interpolation == "area":
+            if x.shape[-2:] == (self.image_size, self.image_size):
+                return x
+            import cv2
+
+            arr = cv2.resize(x[0].numpy(), (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
+            return torch.from_numpy(arr).unsqueeze(0)
+        return torch.nn.functional.interpolate(
+            x.unsqueeze(0),
+            size=(self.image_size, self.image_size),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        ).squeeze(0)

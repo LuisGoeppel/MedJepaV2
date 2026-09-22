@@ -36,6 +36,30 @@ python run_transfer_experiment.py --run-config config/transfer.json
 
 Edit the checkpoint, dataset and output paths in the example configurations for your environment. The transfer command also accepts the previous experiment's CLI flags; explicitly supplied flags override JSON settings.
 
+## Supervised baselines
+
+The three supervised experiments live in `supervised/`. Run them as modules from this folder (or install the project first). Their existing CLI flags are retained:
+
+```bash
+python -m supervised.run_baseline --full-csv /data/mg-only-all.csv --bin /data/mg-only-all.bin --train-csv /data/train.csv --val-csv /data/val.csv --test-csv /data/test.csv --output-dir /runs/baseline
+python -m supervised.run_data_ablation --mg-dir /data --output-dir /runs/data_ablation
+python -m supervised.run_backbone_resolution --mg-dir /data --output-dir /runs/resolution --parallel-gpus 0 1
+```
+
+| Previous script | New module | Protocol |
+| --- | --- | --- |
+| `run_mg_supervised_weighted_ce_simple.py` | `supervised.run_baseline` | One weighted-CE model using predefined splits; optional training subsampling |
+| `run_mg_supervised_baselines.py` | `supervised.run_data_ablation` | Balanced training sizes across all data, one machine family and one view |
+| `run_mg_supervised_resolution_backbone_baselines.py` | `supervised.run_backbone_resolution` | Backbones/resolutions sharing one minority-inclusive training subset and evaluation pools |
+
+The drivers own sampling, schedules, checkpoint payloads and result aggregation. `core.supervised.fit_supervised` owns the common epoch loop and checkpoint-selection mechanism; `core.plotting` renders the reports. No experiment imports another experiment.
+
+Historical defaults remain explicit: sweeps use percentile normalization with min/max fallback, OpenCV area resizing and FP16 with gradient scaling; the single baseline uses uint16 normalization and bilinear resizing by default, BF16, warmup and dropped incomplete training batches. The resolution sweep uses weighted validation/test loss and monitors balanced accuracy, macro F1 and loss; improvement in any resets its patience. The single baseline uses unweighted evaluation loss and selects by balanced accuracy. History/metric files retain their previous keys, with additional shared diagnostics; plot layouts are standardized.
+
+Baseline label policies are separate from LeJEPA's numeric 1–5 policy. Sweeps accept numeric BI-RADS 0 and 6; the single baseline accepts 6 but excludes numeric 0. Existing label-column precedence is retained. The data ablation's evaluation pools remain fixed across sizes **within** each dataset setting, but differ between settings.
+
+Intentional corrections: predefined splits now reject patient/image overlap, invalid indices and duplicate images; generated splits require patient identifiers rather than falling back to row splitting. Unknown BIN layouts fail instead of guessing 512×512 uint16. Resolution workers select their assigned CUDA device, and directory names include the actual requested training size. GPU numbers are indices within the job's visible CUDA devices. Do not combine `--parallel-gpus` and `--data-parallel`.
+
 ## Configuration
 
 - `config/mg_v7_hologic_lorad_config.json` keeps the existing v7 training schema. Its `paths.analysis_config` references `analysis.json`, and `paths.augmentation_config` references `mg_lejepa_aug_v4.json`.
@@ -57,7 +81,7 @@ The training run records resolved settings and the augmentation configuration. A
 | `core/loss.py` | Invariance loss, projection normalization and all SIGReg variants |
 | `core/training.py` | LeJEPA optimization, epoch loop and training workflow |
 | `core/training_utils.py` | DDP lifecycle, runtime metadata, checkpoints, diagnostics and SSL loaders |
-| `core/supervised.py` | Supervised loaders, a weighted cross-entropy epoch and evaluation |
+| `core/supervised.py` | Supervised loaders, training/evaluation epochs and single-baseline fitting |
 | `core/plotting.py` | History grids, diagnostics, confusion matrices, class distributions and summary plots |
 | `core/features.py` | Shared analysis workflow and ordered embedding extraction |
 | `core/pca.py` | Sampling and PCA PDF generation from features |
@@ -93,7 +117,7 @@ The four original standalone implementations were replaced as follows:
 | `create_medjepa_pca_report.py` | `analyze_medjepa.py`, with PCA enabled |
 | `run_jepa_transfer_label_efficiency_v2.py` | `run_transfer_experiment.py` |
 
-The initial source snapshot is Git commit `463d46b`. Other top-level experiments, the notebook and `old/` remain outside this refactoring scope and retain their original standalone implementations.
+The initial source snapshot is Git commit `463d46b`. The three additional supervised scripts are migrated as described above. Remaining top-level experiments, the notebook and `old/` retain their standalone implementations.
 
 The training objective, tensor layout, schedules and transfer subset strategies are retained. Transfer also retains model reuse between runs and nonpersistent workers. With multiple seed repetitions in one process, initial model weights are shared, as before; use separate processes with different seeds for independent initializations.
 
@@ -106,16 +130,18 @@ These corrections are intentional and can affect comparisons with old reports:
 
 ## Environment and checks
 
-Upload the entry points, **entire `core/` directory** and referenced configurations together. Launch jobs from a fixed snapshot so subsequent uploads do not change queued jobs. No package installation is needed to import `core` when the scripts and package are adjacent. The distribution name in `pyproject.toml` remains `medjepa`, since that names the project, while its Python package is `core`.
+Upload the entry points, **entire `core/` directory**, **`supervised/` directory** and referenced configurations together. Launch jobs from a fixed snapshot so subsequent uploads do not change queued jobs. No package installation is needed when launching the documented commands from this folder. The distribution name in `pyproject.toml` remains `medjepa`; it includes the `core` and `supervised` Python packages.
 
 `pyproject.toml` declares dependencies. In a prepared environment, optional editable installation is:
 
 ```bash
-python -m pip install -e ".[test]"
+python -m pip install -e ".[test,opencv]"
 python -m pytest -q
-python -m ruff check core tests train_medjepa.py analyze_medjepa.py run_transfer_experiment.py
+python -m ruff check core supervised tests train_medjepa.py analyze_medjepa.py run_transfer_experiment.py
 ```
 
-Keep the cluster's working PyTorch/torchvision/CUDA combination. The local `.venv/` is ignored by Git and uses CPU PyTorch for verification; it should not be uploaded as the cluster environment. OpenCV is optional but affects connected-component corner-mask behavior and CLAHE; use the same OpenCV availability when comparing runs.
+Keep the cluster's working PyTorch/torchvision/CUDA combination. The local `.venv/` is ignored by Git and uses CPU PyTorch for verification; it should not be uploaded as the cluster environment. OpenCV is required for resizing in the two supervised sweeps. It also affects connected-component corner-mask behavior and CLAHE; use the same OpenCV availability when comparing runs.
 
 Tests use synthetic uint16 images and a small real timm ViT, with no dataset or pretrained-weight downloads. They cover checkpoint compatibility, row alignment, preprocessing, losses/gradients, nested budgets, training/resume, shared extraction, PCA/probes and all transfer modes. GPU/DDP execution still requires a cluster smoke run.
+
+Supervised tests also exercise all three baseline entry points, ViT/ResNet construction, reports, label/preprocessing policies, split validation, multi-metric early stopping and assigned-device selection. GPU assignment is mocked locally; actual FP16/BF16 and concurrent GPU execution require a cluster run.

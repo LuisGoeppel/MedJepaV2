@@ -1,8 +1,9 @@
 """Stateless plotting functions used by training and experiment reports."""
 
 from __future__ import annotations
-from pathlib import Path
 from typing import Any
+from matplotlib.backends.backend_pdf import PdfPages
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -316,3 +317,158 @@ def plot_summary_outputs(df: pd.DataFrame, mean_df: pd.DataFrame, out_dir: Path)
     plt.tight_layout()
     plt.savefig(out_dir / "summary_predicted_class_fractions.png", dpi=200)
     plt.close()
+
+
+def plot_data_ablation_summary(output_dir, summary_df, all_results):
+    pdf_path = output_dir / "summary_report.pdf"
+    with PdfPages(pdf_path) as pdf:
+        fig, ax = plt.subplots(figsize=(14, max(5, 0.45 * len(summary_df) + 2)))
+        ax.axis("off")
+        ax.set_title("MG supervised BI-RADS baselines: summary", fontsize=14, pad=16)
+        display_cols = [
+            "status",
+            "experiment",
+            "train_size_requested",
+            "test_accuracy",
+            "test_balanced_accuracy",
+            "test_macro_f1",
+            "best_epoch",
+            "reason",
+        ]
+        display_df = summary_df[[c for c in display_cols if c in summary_df.columns]].copy()
+        for col in ["test_accuracy", "test_balanced_accuracy", "test_macro_f1"]:
+            if col in display_df.columns:
+                display_df[col] = display_df[col].apply(lambda x: "" if pd.isna(x) else f"{float(x):.4f}")
+        table = ax.table(
+            cellText=display_df.fillna("").values, colLabels=display_df.columns, loc="center", cellLoc="center"
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        table.scale(1, 1.25)
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+        completed = summary_df[summary_df["status"] == "completed"].copy()
+        if not completed.empty:
+            fig, ax = plt.subplots(figsize=(13, 5))
+            x = np.arange(len(completed))
+            ax.bar(x, completed["test_balanced_accuracy"].astype(float).values)
+            ax.set_xticks(x)
+            ax.set_xticklabels(completed["experiment"].astype(str).tolist(), rotation=45, ha="right")
+            ax.set_ylabel("Test balanced accuracy")
+            ax.set_ylim(0.0, 1.0)
+            ax.set_title("Test balanced accuracy by experiment")
+            ax.grid(axis="y", alpha=0.25)
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+        for result in all_results:
+            if result.get("status") != "completed":
+                continue
+            exp_name = result.get("experiment", {}).get("name", "unknown")
+            cm = result.get("test_metrics_best_model", {}).get("confusion_matrix")
+            if cm is None:
+                continue
+            arr = np.array(cm, dtype=int)
+            fig, ax = plt.subplots(figsize=(5.6, 5.0))
+            im = ax.imshow(arr)
+            ax.set_title(f"{exp_name}\nTest confusion matrix")
+            ax.set_xlabel("Predicted")
+            ax.set_ylabel("True")
+            ax.set_xticks(range(len(CLASS_NAMES)))
+            ax.set_yticks(range(len(CLASS_NAMES)))
+            ax.set_xticklabels(CLASS_NAMES, rotation=30, ha="right")
+            ax.set_yticklabels(CLASS_NAMES)
+            for i in range(arr.shape[0]):
+                for j in range(arr.shape[1]):
+                    ax.text(j, i, str(arr[i, j]), ha="center", va="center")
+            fig.colorbar(im, ax=ax)
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+    print(f"Wrote aggregate summary: {output_dir / 'summary.csv'}")
+    print(f"Wrote aggregate JSON:    {output_dir / 'summary.json'}")
+    print(f"Wrote summary PDF:       {pdf_path}")
+
+
+def plot_resolution_summary(output_dir, summary_df, results):
+    pdf_path = output_dir / "summary_report.pdf"
+    with PdfPages(pdf_path) as pdf:
+        fig, ax = plt.subplots(figsize=(14, max(5, 0.45 * max(1, len(summary_df)) + 2)))
+        ax.axis("off")
+        ax.set_title("MG supervised resolution/backbone baseline", fontsize=14, pad=16)
+        display_cols = [
+            "status",
+            "backbone",
+            "image_size",
+            "epochs_run",
+            "test_balanced_accuracy",
+            "test_macro_f1",
+            "test_accuracy",
+            "best_epoch_val_bal_acc",
+        ]
+        display_df = summary_df[[c for c in display_cols if c in summary_df.columns]].copy()
+        for col in ["test_accuracy", "test_balanced_accuracy", "test_macro_f1"]:
+            if col in display_df.columns:
+                display_df[col] = display_df[col].apply(lambda x: "" if pd.isna(x) else f"{float(x):.4f}")
+        table = ax.table(
+            cellText=display_df.fillna("").values, colLabels=display_df.columns, loc="center", cellLoc="center"
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        table.scale(1, 1.25)
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        completed = summary_df[summary_df["status"] == "completed"].copy()
+        if not completed.empty:
+            labels = [
+                f"{b}\n{int(s)}" for b, s in zip(completed["backbone"].astype(str), completed["image_size"].astype(int))
+            ]
+            for metric, title in [
+                ("test_balanced_accuracy", "Test balanced accuracy"),
+                ("test_macro_f1", "Test macro F1"),
+            ]:
+                fig, ax = plt.subplots(figsize=(11, 5))
+                x = np.arange(len(completed))
+                ax.bar(x, completed[metric].astype(float).values)
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels, rotation=30, ha="right")
+                ax.set_ylabel(title)
+                ax.set_title(f"{title} by backbone and image size")
+                ax.grid(axis="y", alpha=0.25)
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+
+        for result in results:
+            if result.get("status") != "completed":
+                continue
+            exp_name = result.get("experiment", {}).get("name", "unknown")
+            cm = (result.get("test_metrics_primary_best_bal_acc", {}) or {}).get("confusion_matrix")
+            if cm is None:
+                continue
+            arr = np.array(cm, dtype=int)
+            fig, ax = plt.subplots(figsize=(5.6, 5.0))
+            im = ax.imshow(arr)
+            ax.set_title(f"{exp_name}\nTest confusion matrix")
+            ax.set_xlabel("Predicted")
+            ax.set_ylabel("True")
+            ax.set_xticks(range(len(CLASS_NAMES)))
+            ax.set_yticks(range(len(CLASS_NAMES)))
+            ax.set_xticklabels(CLASS_NAMES, rotation=30, ha="right")
+            ax.set_yticklabels(CLASS_NAMES)
+            for i in range(arr.shape[0]):
+                for j in range(arr.shape[1]):
+                    ax.text(j, i, str(arr[i, j]), ha="center", va="center")
+            fig.colorbar(im, ax=ax)
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+    print(f"Wrote summary CSV:  {output_dir / 'summary.csv'}")
+    print(f"Wrote summary JSON: {output_dir / 'summary.json'}")
+    print(f"Wrote summary PDF:  {pdf_path}")
+
+
+def plot_baseline_history(history, out_path):
+    if not history:
+        return
+    if isinstance(history, list):
+        history = {key: [row[key] for row in history] for key in history[0]}
+    keys = ["train_loss", "val_loss", "val_balanced_accuracy", "val_macro_f1", "lr", "train_accuracy"]
+    plot_history_grid(history, keys, np.arange(1, len(history["train_loss"]) + 1), (2, 3), (14, 8), out_path)

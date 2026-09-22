@@ -1,6 +1,7 @@
 """Run settings and JSON configuration; no ML dependencies required."""
 
 from __future__ import annotations
+import re
 import argparse
 import json
 from dataclasses import dataclass, fields
@@ -523,3 +524,18 @@ def parse_transfer_config() -> ExperimentConfig:
     for key in ("subset_sizes", "modes"):
         values[key] = tuple(values[key])
     return ExperimentConfig(**values)
+
+
+def slugify(value: str) -> str:
+    value = str(value).strip().lower().replace("/", "_")
+    value = re.sub(r"[^a-z0-9._-]+", "_", value)
+    value = re.sub(r"_+", "_", value)
+    return value.strip("_") or "unknown"
+
+
+def human_seconds(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}min"
+    return f"{seconds / 3600:.2f}h"

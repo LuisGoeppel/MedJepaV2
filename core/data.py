@@ -6,7 +6,9 @@ import json
 import random
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Dict, Tuple
+from dataclasses import dataclass
+from sklearn.model_selection import train_test_split
 import numpy as np
 import pandas as pd
 import torch
@@ -18,12 +20,13 @@ CLASS_NAMES = ["routine", "follow_up", "biopsy"]
 CLASS_TO_INDEX = {name: i for i, name in enumerate(CLASS_NAMES)}
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, *, benchmark: bool = True) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
+    if benchmark:
+        torch.backends.cudnn.benchmark = True
 
 
 def normalize_birads_value(x: Any) -> float:
@@ -133,7 +136,7 @@ def _extract_age_group(x: Any) -> str:
     s = str(x).strip()
     if not s or s.lower() in {"nan", "none", "unknown", "missing"}:
         return "unknown"
-    m = re.search(r"(\d{2,3})\s*[-–]\s*(\d{2,3})", s)
+    m = re.search(r"(\d{2,3})\s*[-â€“]\s*(\d{2,3})", s)
     if m:
         return f"{m.group(1)}-{m.group(2)}"
     m = re.search(r"\d{2,3}", s)
@@ -282,6 +285,7 @@ class MammographyDataset(Dataset):
         normalize_mode: str = "uint16",
         percentile_low: float = 1.0,
         percentile_high: float = 99.0,
+        percentile_fallback: bool = False,
     ):
         self.df = df.reset_index(drop=True)
         self.bin_path = Path(bin_path)
@@ -292,6 +296,7 @@ class MammographyDataset(Dataset):
         self.normalize_mode = normalize_mode
         self.percentile_low = float(percentile_low)
         self.percentile_high = float(percentile_high)
+        self.percentile_fallback = percentile_fallback
         self._imgs: Optional[np.memmap] = None
         if "original_index" not in self.df.columns:
             raise ValueError("Split dataframe requires original_index.")
@@ -314,7 +319,15 @@ class MammographyDataset(Dataset):
         if self.normalize_mode == "uint16":
             arr = arr / 65535.0 if self.dtype == np.dtype("uint16") else arr / max(float(arr.max()), 1.0)
         elif self.normalize_mode == "per_image_percentile":
-            lo, hi = np.percentile(arr, [self.percentile_low, self.percentile_high])
+            if self.percentile_fallback:
+                # Legacy sweeps used scalar percentile calls. NumPy can retain
+                # float32 here while the vector call below promotes to float64.
+                lo = np.percentile(arr, self.percentile_low)
+                hi = np.percentile(arr, self.percentile_high)
+            else:
+                lo, hi = np.percentile(arr, [self.percentile_low, self.percentile_high])
+            if hi <= lo and self.percentile_fallback:
+                lo, hi = float(arr.min()), float(arr.max())
             arr = np.zeros_like(arr, dtype=np.float32) if hi <= lo else np.clip((arr - lo) / (hi - lo), 0, 1)
         else:
             raise ValueError(f"Unknown normalize_mode: {self.normalize_mode}")
@@ -365,3 +378,409 @@ def collate_batch(batch):
     views = torch.stack([b[0] for b in batch])
     labels = torch.tensor([b[1] for b in batch], dtype=torch.long)
     return views, labels
+
+
+@dataclass
+class BinSpec:
+    dtype: str
+    height: int
+    width: int
+    channels: int
+    exact_match: bool
+
+
+def infer_bin_spec(bin_path: Path, n_rows: int) -> BinSpec:
+    actual = bin_path.stat().st_size
+    candidates = [
+        ("uint16", np.dtype("uint16"), 512, 512, 1),
+        ("uint8", np.dtype("uint8"), 512, 512, 1),
+        ("float32", np.dtype("float32"), 512, 512, 1),
+        ("uint16", np.dtype("uint16"), 224, 224, 1),
+        ("uint8", np.dtype("uint8"), 224, 224, 1),
+    ]
+    for dtype_name, dtype, h, w, c in candidates:
+        if n_rows * h * w * c * dtype.itemsize == actual:
+            return BinSpec(dtype=dtype_name, height=h, width=w, channels=c, exact_match=True)
+    raise ValueError(f"BIN size {actual} does not match a supported shape/dtype for {n_rows} raw CSV rows.")
+
+
+def open_memmap(bin_path: Path, spec: BinSpec, n_rows: int) -> np.memmap:
+    dtype = np.dtype(spec.dtype)
+    shape = (
+        (n_rows, spec.height, spec.width) if spec.channels == 1 else (n_rows, spec.height, spec.width, spec.channels)
+    )
+    return np.memmap(bin_path, dtype=dtype, mode="r", shape=shape)
+
+
+def summarize_df(df: pd.DataFrame) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {"rows": int(len(df))}
+    if "patient" in df.columns:
+        summary["patients"] = int(df["patient"].nunique(dropna=True))
+    for col in ["collapsed_birads", "machine_family", "view", "dataset"]:
+        if col in df.columns:
+            summary[f"{col}_counts"] = {
+                str(k): int(v) for k, v in df[col].fillna("missing").astype(str).value_counts().to_dict().items()
+            }
+    return summary
+
+
+def infer_machine_family(machine: object) -> str:
+    if pd.isna(machine):
+        return "unknown"
+    text = str(machine).lower()
+    if any(x in text for x in ["hologic", "lorad", "selenia", "dimensions", "3dimensions"]):
+        return "Hologic/Lorad"
+    if any(x in text for x in ["howtek", "lumisys", "lumysis"]):
+        return "Howtek/Lumysis"
+    if any(x in text for x in ["senographe", "ge healthcare", "general electric"]):
+        return "GE/Senographe"
+    if re.search(r"(^|[^a-z])ge([^a-z]|$)", text):
+        return "GE/Senographe"
+    return "unknown"
+
+
+def normalize_view(value: object) -> Optional[str]:
+    if pd.isna(value):
+        return None
+    text = str(value).strip().upper()
+    cleaned = re.sub(r"[^A-Z0-9_ -]+", " ", text)
+    tokens = set(re.split(r"[\s_/-]+", cleaned))
+    for candidate in ["MLO", "CC", "LMO", "LM", "ML", "XCCL", "XCCM", "FB"]:
+        if candidate in tokens or cleaned == candidate:
+            return candidate
+    m = re.search(r"(^|[^A-Z])(MLO|CC|XCCL|XCCM|LMO|LM|ML)([^A-Z]|$)", cleaned)
+    if m:
+        return m.group(2)
+    return None
+
+
+def infer_view_from_row(row: pd.Series, include_exam: bool = True) -> str:
+    cols = [
+        "view",
+        "ViewPosition",
+        "view_position",
+        "viewposition",
+        "projection",
+        "position",
+        "id",
+        "context",
+        "findings",
+        "image_path",
+        "path",
+        "filename",
+        "file",
+        "dicom_path",
+        "png_path",
+        "jpg_path",
+        "original_path",
+        "exam",
+    ]
+    for col in cols if include_exam else [c for c in cols if c != "exam"]:
+        if col in row.index:
+            v = normalize_view(row[col])
+            if v is not None:
+                return v
+    return "unknown"
+
+
+def parse_birads_number(value: object, policy: str = "resolution") -> Optional[int]:
+    if pd.isna(value):
+        return None
+    text = str(value).strip().lower()
+    if text in {"", "nan", "none", "missing", "unknown"}:
+        return None
+    if policy == "data_ablation":
+        try:
+            numeric = float(text)
+            if np.isfinite(numeric):
+                return int(numeric)
+        except ValueError:
+            pass
+        match = re.search(r"([0-6])", text)
+        return int(match.group(1)) if match else None
+    m = re.search(r"\(([0-6])\)", text)
+    if m:
+        return int(m.group(1))
+    try:
+        f = float(text)
+        if np.isfinite(f):
+            return int(f)
+    except Exception:
+        pass
+    m = re.search(r"(^|[^0-9])([0-6])([^0-9]|$)", text)
+    if m:
+        return int(m.group(2))
+    return None
+
+
+def collapse_birads_value(value: object, policy: str = "resolution") -> Optional[str]:
+    if pd.isna(value):
+        return None
+    raw = str(value).strip().lower()
+    if raw in {"", "nan", "none", "missing", "unknown"}:
+        return None
+    norm = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+    if norm in CLASS_TO_INDEX:
+        return norm
+
+    # Native MG actionability strings.
+    # Order matters: "probably benign" should be follow_up, not routine.
+    if "biopsy" in raw or "suspicious" in raw or "malignan" in raw:
+        return "biopsy"
+    if "follow" in raw or "probably benign" in raw or "probably_benign" in norm:
+        return "follow_up"
+    if "routine" in raw or "healthy" in raw or "negative" in raw or raw == "benign" or norm == "benign":
+        return "routine"
+
+    n = parse_birads_number(value, policy=policy)
+    if n is None:
+        return None
+    if n in {1, 2}:
+        return "routine"
+    if n in {0, 3}:
+        return "follow_up"
+    if n in {4, 5, 6}:
+        return "biopsy"
+    return None
+
+
+def mode_or_first(s: pd.Series) -> str:
+    mode = s.mode()
+    return str(mode.iloc[0]) if len(mode) > 0 else str(s.iloc[0])
+
+
+def make_patient_disjoint_pools(
+    df: pd.DataFrame,
+    seed: int,
+    train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    if "patient" not in df or df["patient"].isna().any():
+        raise ValueError("Patient identifiers are required for supervised splits.")
+    if not np.isclose(train_ratio + val_ratio + test_ratio, 1.0) or min(train_ratio, val_ratio, test_ratio) <= 0:
+        raise ValueError("Split ratios must be positive and sum to one.")
+
+    groups = (
+        df.groupby("patient", dropna=False)
+        .agg(n_rows=("patient", "size"), label=("collapsed_birads", mode_or_first))
+        .reset_index()
+    )
+    try:
+        train_groups, tmp_groups = train_test_split(
+            groups, train_size=train_ratio, random_state=seed, shuffle=True, stratify=groups["label"]
+        )
+    except ValueError:
+        train_groups, tmp_groups = train_test_split(
+            groups, train_size=train_ratio, random_state=seed, shuffle=True, stratify=None
+        )
+    val_fraction = val_ratio / (val_ratio + test_ratio)
+    try:
+        val_groups, test_groups = train_test_split(
+            tmp_groups, train_size=val_fraction, random_state=seed + 1, shuffle=True, stratify=tmp_groups["label"]
+        )
+    except ValueError:
+        val_groups, test_groups = train_test_split(
+            tmp_groups, train_size=val_fraction, random_state=seed + 1, shuffle=True, stratify=None
+        )
+
+    train_ids = set(train_groups["patient"])
+    val_ids = set(val_groups["patient"])
+    test_ids = set(test_groups["patient"])
+    train_df = df[df["patient"].isin(train_ids)].copy()
+    val_df = df[df["patient"].isin(val_ids)].copy()
+    test_df = df[df["patient"].isin(test_ids)].copy()
+    train_pat = set(train_df["patient"].dropna().astype(str))
+    val_pat = set(val_df["patient"].dropna().astype(str))
+    test_pat = set(test_df["patient"].dropna().astype(str))
+    info = {
+        "split_type": "patient_disjoint",
+        "patient_overlap": {
+            "train_vs_val": len(train_pat & val_pat),
+            "train_vs_test": len(train_pat & test_pat),
+            "val_vs_test": len(val_pat & test_pat),
+        },
+    }
+    verify_no_patient_leakage(train_df, val_df, test_df)
+    return train_df, val_df, test_df, info
+
+
+def clean_column_name(name: object) -> str:
+    text = str(name).strip().lstrip("\ufeff")
+    text = text.replace("-", "_").replace(" ", "_")
+    text = re.sub(r"[^A-Za-z0-9_]+", "_", text)
+    text = re.sub(r"_+", "_", text)
+    return text.strip("_").lower()
+
+
+def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    rename = {c: clean_column_name(c) for c in out.columns}
+    out = out.rename(columns=rename)
+
+    # Common aliases. Only rename when this does not overwrite an existing column.
+    aliases = {
+        "birads_num": "birads_numeric",
+        "birads_number": "birads_numeric",
+        "birads_score": "birads_numeric",
+        "original_birads_numeric": "birads_numeric",
+        "original_birads_score": "original_birads",
+        "actionability": "collapsed_birads",
+        "action": "collapsed_birads",
+        "label": "collapsed_birads",
+        "view_position": "view",
+        "viewposition": "view",
+        "manufacturer_model_name": "machine",
+    }
+    for src, dst in aliases.items():
+        if src in out.columns and dst not in out.columns:
+            out = out.rename(columns={src: dst})
+
+    return out
+
+
+def prepare_baseline_metadata(df, *, policy):
+    """Preserve the two sweeps' column precedence and numeric-string parsing."""
+    if policy not in {"data_ablation", "resolution"}:
+        raise ValueError(f"Unknown baseline label policy: {policy}")
+    out = standardize_columns(df) if policy == "data_ablation" else df.rename(columns=lambda c: str(c).strip()).copy()
+    out["source_index"] = np.arange(len(out), dtype=np.int64)
+    candidates = (
+        ["birads_numeric", "birads", "original_birads"]
+        if policy == "data_ablation"
+        else ["birads", "original_birads", "birads_numeric"]
+    )
+    column = next((c for c in ["collapsed_birads", *candidates] if c in out), None)
+    if column is None:
+        raise ValueError("No BI-RADS label column found.")
+    out["collapsed_birads"] = out[column].map(lambda value: collapse_birads_value(value, policy=policy))
+    out = out[out["collapsed_birads"].isin(CLASS_NAMES)].copy()
+    if out.empty:
+        raise ValueError("No valid supervised labels remain.")
+    out["target"] = out["collapsed_birads"].map(CLASS_TO_INDEX).astype(int)
+    if "machine_family" not in out:
+        out["machine_family"] = out["machine"].map(infer_machine_family) if "machine" in out else "unknown"
+    if "view" not in out:
+        out["view"] = out.apply(lambda row: infer_view_from_row(row, include_exam=policy == "resolution"), axis=1)
+    return out
+
+
+def parse_birads_numeric(x: Any) -> Optional[int]:
+    if pd.isna(x):
+        return None
+    s = str(x).strip().lower()
+    for k in ["1", "2", "3", "4", "5", "6"]:
+        if s == k or s.startswith(k + ".") or s.startswith(k + " ") or f"({k})" in s:
+            return int(k)
+    try:
+        val = int(float(s))
+        return val if val in {1, 2, 3, 4, 5, 6} else None
+    except Exception:
+        return None
+
+
+def collapse_label_from_row(row: pd.Series) -> str:
+    # Prefer already-derived collapsed_birads when present.
+    if "collapsed_birads" in row and not pd.isna(row["collapsed_birads"]):
+        s = str(row["collapsed_birads"]).strip().lower()
+        s = s.replace("-", "_").replace(" ", "_")
+        if s in CLASS_TO_INDEX:
+            return s
+
+    # Then support the actionability strings used in mg-only-all.csv.
+    if "birads" in row and not pd.isna(row["birads"]):
+        s = str(row["birads"]).strip().lower()
+        if "suspicious" in s or "malignan" in s or "biopsy" in s:
+            return "biopsy"
+        if "follow" in s or "probably benign" in s:
+            return "follow_up"
+        if "routine" in s or "healthy" in s:
+            return "routine"
+
+    # Fallback to original_birads / numeric birads.
+    for col in ["original_birads", "birads_numeric", "birads"]:
+        if col in row:
+            n = parse_birads_numeric(row[col])
+            if n in (1, 2):
+                return "routine"
+            if n == 3:
+                return "follow_up"
+            if n in (4, 5, 6):
+                return "biopsy"
+    return "unknown"
+
+
+def prepare_baseline_split(df, full_df, split_name):
+    df = df.copy()
+    df["collapsed_birads"] = df.apply(collapse_label_from_row, axis=1)
+    df = df[df["collapsed_birads"].isin(CLASS_NAMES)].copy()
+    df["target"] = df["collapsed_birads"].map(CLASS_TO_INDEX).astype(int)
+    # Older standalone runs used exam first; core validates the resulting indices.
+    if "original_index" not in df and "exam" in df and "exam" in full_df:
+        keys = full_df["exam"].astype(str)
+        if keys.duplicated().any():
+            raise ValueError("full_csv exam column is not unique; supply original_index.")
+        df["original_index"] = df["exam"].astype(str).map(pd.Series(np.arange(len(full_df)), index=keys))
+    return ensure_original_index(df, full_df, split_name).reset_index(drop=True)
+
+
+def validate_split_frames(train, val, test):
+    verify_no_patient_leakage(train, val, test)
+    indices = [set(df["original_index"]) for df in (train, val, test)]
+    if any(indices[a] & indices[b] for a, b in ((0, 1), (0, 2), (1, 2))):
+        raise ValueError("Image overlap between supervised splits")
+
+
+class BaselineDataset(MammographyDataset):
+    """Adapt baseline column names to the common memmap reader."""
+
+    def __init__(
+        self,
+        df,
+        bin_path,
+        full_num_rows,
+        image_shape,
+        dtype,
+        image_size,
+        train,
+        normalize_mode="uint16",
+        percentile_low=1.0,
+        percentile_high=99.0,
+        hflip_p=0.5,
+        interpolation="bilinear",
+        percentile_fallback=False,
+    ):
+        from .transforms import BaselineTransform
+
+        frame = df.rename(columns={"source_index": "original_index"}) if "original_index" not in df else df
+        super().__init__(
+            frame,
+            bin_path,
+            full_num_rows,
+            image_shape,
+            dtype,
+            BaselineTransform(image_size, hflip_p if train else 0.0, interpolation),
+            normalize_mode,
+            percentile_low,
+            percentile_high,
+            percentile_fallback,
+        )
+
+    def __getitem__(self, idx):
+        return self.transform(self.image_at(idx)), torch.tensor(int(self.df.iloc[idx]["target"]), dtype=torch.long)
+
+
+def baseline_dataset_from_memmap(df, mmap, image_size, train, augment):
+    return BaselineDataset(
+        df,
+        mmap.filename,
+        mmap.shape[0],
+        mmap.shape[1:3],
+        mmap.dtype,
+        image_size,
+        train,
+        "per_image_percentile",
+        hflip_p=0.5 if augment else 0.0,
+        interpolation="area",
+        percentile_fallback=True,
+    )
