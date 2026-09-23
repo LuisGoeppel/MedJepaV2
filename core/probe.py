@@ -213,7 +213,7 @@ def run_one_probe(
 
     train_metrics = evaluate_probe(probe, train_x_sub, train_y_sub, class_names, device)
     val_metrics = evaluate_probe(probe, val_x, val_y, class_names, device)
-    test_metrics = evaluate_probe(probe, test_x, test_y, class_names, device)
+    test_metrics = evaluate_probe(probe, test_x, test_y, class_names, device) if args.evaluate_test else None
 
     return {
         "target": target_name,
@@ -249,7 +249,10 @@ def run_probe_report(
     args = argparse.Namespace(**asdict(settings), seed=seed)
     train_x, train_df = features["train"]
     val_x, val_df = features["val"]
-    test_x, test_df = features["test"]
+    if settings.evaluate_test:
+        test_x, test_df = features["test"]
+    else:
+        test_x, test_df = train_x[:0], train_df.iloc[:0].copy()
     train_df, val_df, test_df, grouping = apply_machine_grouping(
         train_df, val_df, test_df, args.machine_min_train_count, args.machine_top_k
     )
@@ -263,7 +266,8 @@ def run_probe_report(
             continue
         row = {"target": target, "num_classes": result["num_classes"]}
         for split in ("val", "test"):
-            row.update({f"{split}_{key}": value for key, value in result["metrics"][split].items()})
+            if result["metrics"][split] is not None:
+                row.update({f"{split}_{key}": value for key, value in result["metrics"][split].items()})
         summary.append(row)
     output = {
         "checkpoint": str(checkpoint),

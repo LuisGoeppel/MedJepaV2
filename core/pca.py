@@ -317,3 +317,35 @@ def run_pca_report(features: dict, settings, seed: int, checkpoint: str, output_
     selected = sample_dataframe(metadata, args)
     values = embeddings[selected.pop("_feature_row").to_numpy(dtype=int)]
     create_pdf_report(selected, values, args, output_pdf)
+
+
+def run_compact_pca(features: dict, settings, seed: int, output_dir: Path) -> None:
+    """Save one 2D figure and its coordinates for later report composition."""
+    from dataclasses import asdict
+
+    names = ["train", "val", "test"] if settings.split == "all" else [settings.split]
+    metadata = pd.concat([features[name][1] for name in names], ignore_index=True)
+    embeddings = np.concatenate([features[name][0].numpy() for name in names])
+    metadata["_feature_row"] = np.arange(len(metadata))
+    selected = sample_dataframe(metadata, argparse.Namespace(**asdict(settings), seed=seed))
+    values = embeddings[selected.pop("_feature_row").to_numpy(dtype=int)]
+    if min(values.shape) < 2:
+        raise ValueError("Compact PCA requires at least two rows and two embedding dimensions")
+    column = (settings.color_by or ["collapsed_birads"])[0]
+    labels = make_label_series(selected, column, settings.max_categories)
+    pca = PCA(n_components=2, svd_solver="full")
+    coords = pca.fit_transform(values)
+    variance = np.nan_to_num(pca.explained_variance_ratio_)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_dir / "pca_coordinates.npz", coordinates=coords, labels=labels.to_numpy(dtype=str),
+        original_index=selected["original_index"].to_numpy(), explained_variance_ratio=variance,
+        color_by=np.asarray(column),
+    )
+    fig, ax = plt.subplots(figsize=(7, 6))
+    plot_pca2(ax, coords, labels, f"Backbone embeddings ({settings.split})", column, settings.max_categories)
+    ax.set_xlabel(f"PC1 ({variance[0]:.1%})")
+    ax.set_ylabel(f"PC2 ({variance[1]:.1%})")
+    fig.tight_layout()
+    fig.savefig(output_dir / "pca.png", dpi=160)
+    plt.close(fig)

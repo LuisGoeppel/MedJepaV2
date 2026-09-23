@@ -298,6 +298,7 @@ class PCAConfig:
     max_categories: int = 12
     include_raw_columns: bool = False
     color_by: Optional[list[str]] = None
+    output_format: str = "pdf"  # compact: one 2D PNG plus reusable coordinates
 
 
 @dataclass
@@ -313,6 +314,7 @@ class ProbeConfig:
     select_best_by: str = "val_macro_f1"
     machine_min_train_count: int = 20
     machine_top_k: int = 0
+    evaluate_test: bool = True
 
 
 @dataclass
@@ -331,7 +333,11 @@ class AnalysisConfig:
 
 
 def load_analysis_config(path: str | Path) -> AnalysisConfig:
-    raw = read_json(path)
+    return analysis_config_from_dict(read_json(path))
+
+
+def analysis_config_from_dict(raw: dict[str, Any]) -> AnalysisConfig:
+    """Validate analysis settings supplied either inline or in a separate JSON."""
     unknown = set(raw) - {"seed", "feature_extraction", "pca", "probe"}
     if unknown:
         raise ValueError(f"Unknown analysis settings: {sorted(unknown)}")
@@ -347,6 +353,10 @@ def load_analysis_config(path: str | Path) -> AnalysisConfig:
         raise ValueError("PCA split must be train, val, test or all")
     if cfg.pca.sampling not in {"random", "balanced_collapsed"}:
         raise ValueError("Unknown PCA sampling policy")
+    if cfg.pca.output_format not in {"pdf", "compact"}:
+        raise ValueError("PCA output_format must be pdf or compact")
+    if cfg.pca.output_format == "compact" and len(cfg.pca.color_by or ["collapsed_birads"]) != 1:
+        raise ValueError("Compact PCA requires exactly one color_by column")
     if cfg.pca.max_categories < 1 or (0 < cfg.pca.max_samples < 3):
         raise ValueError("PCA requires at least three samples and a positive category limit")
     if cfg.probe.probe_epochs < 1 or cfg.probe.probe_batch_size < 1:
@@ -403,10 +413,11 @@ def parse_transfer_args() -> argparse.Namespace:
     p.add_argument(
         "--subset-strategy",
         default="progressive",
-        choices=["progressive", "balanced", "natural"],
+        choices=["progressive", "balanced", "natural", "oversampling"],
         help=(
             "progressive: V2 nested schedule from balanced small subsets to natural full data; "
-            "balanced: as balanced as uniquely feasible; natural: natural class proportions."
+            "balanced: as balanced as uniquely feasible; natural: natural class proportions; "
+            "oversampling: equal class entry counts, repeating images only after exhausting a class."
         ),
     )
     p.add_argument(

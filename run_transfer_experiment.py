@@ -148,9 +148,15 @@ def build_subset_plan(
     seed: int,
 ) -> dict[str, dict[str, Any]]:
     """Build all subsets for one seed at once, guaranteeing nestedness."""
+    if strategy not in {"progressive", "balanced", "natural", "oversampling"}:
+        raise ValueError(f"Unknown subset strategy: {strategy}")
     full_n = len(train_df)
+    if full_n == 0:
+        raise ValueError("Training split is empty")
     labels = train_df["target_collapsed"].to_numpy(dtype=np.int64)
     capacities = np.bincount(labels, minlength=len(CLASS_NAMES)).astype(np.int64)
+    if strategy == "oversampling" and np.any(capacities == 0):
+        raise ValueError("Oversampling requires at least one image from every class")
     natural_probs = capacities.astype(np.float64) / float(full_n)
 
     budget_pairs = [(b, _budget_to_n(b, full_n)) for b in budget_texts]
@@ -170,7 +176,12 @@ def build_subset_plan(
     specs_by_n: dict[int, dict[str, Any]] = {}
 
     for n in unique_ns:
-        if n >= full_n:
+        if strategy == "oversampling":
+            raw_b = effective_b = 1.0
+            probs = np.full(len(CLASS_NAMES), 1.0 / len(CLASS_NAMES))
+            target_counts = np.full(len(CLASS_NAMES), n // len(CLASS_NAMES), dtype=np.int64)
+            target_counts[: n % len(CLASS_NAMES)] += 1
+        elif n >= full_n:
             raw_b = 0.0
             effective_b = 0.0
             probs = natural_probs.copy()
@@ -207,6 +218,16 @@ def build_subset_plan(
 
     plan: dict[str, dict[str, Any]] = {}
     previous_set: set[int] = set()
+    if strategy == "oversampling":
+        # Every class uses its unique shuffled prefix before drawing repeats.
+        # Reusing the same extended order at every budget also nests multiplicities.
+        repeat_rng = np.random.default_rng(seed + stable_int_from_text("oversampling-repeats"))
+        for c, name in enumerate(CLASS_NAMES):
+            needed = max(spec["target_counts"][name] for spec in specs_by_n.values())
+            if needed > capacities[c]:
+                class_orders[c] = np.concatenate([
+                    class_orders[c], repeat_rng.choice(class_orders[c], size=needed - capacities[c], replace=True)
+                ])
 
     for budget_text, n in sorted(budget_pairs, key=lambda x: x[1]):
         spec = dict(specs_by_n[n])
@@ -219,6 +240,7 @@ def build_subset_plan(
         selected = selected.copy()
         order_rng.shuffle(selected)
         subset_df = train_df.iloc[selected].reset_index(drop=True)
+        unique_counts = {CLASS_NAMES[c]: int(len(np.unique(selected[labels[selected] == c]))) for c in range(len(CLASS_NAMES))}
 
         current_set = set(int(x) for x in selected.tolist())
         nested_ok = previous_set.issubset(current_set)
@@ -235,6 +257,10 @@ def build_subset_plan(
                 "seed": int(seed),
                 "nested_ok": True,
                 "rows": int(len(subset_df)),
+                "unique_rows": int(len(np.unique(selected))),
+                "unique_class_counts": unique_counts,
+                "repeated_rows": int(len(selected) - len(np.unique(selected))),
+                "budget_unit": "training_entries",
                 "actual_counts": {
                     CLASS_NAMES[i]: int((subset_df["target_collapsed"].to_numpy() == i).sum())
                     for i in range(len(CLASS_NAMES))
@@ -429,6 +455,9 @@ def train_one_run(
         "subset_strategy": cfg.subset_strategy,
         "subset_meta": {k: v for k, v in subset_meta.items() if k != "df"},
         "train_used_rows": int(len(train_used)),
+        "train_unique_rows": int(subset_meta["unique_rows"]),
+        "train_unique_class_counts": subset_meta["unique_class_counts"],
+        "train_repeated_rows": int(subset_meta["repeated_rows"]),
         "train_used_class_counts": {CLASS_NAMES[i]: int((labels_np == i).sum()) for i in range(3)},
         "val_rows": int(len(val_df)),
         "test_rows": int(len(test_df)),
@@ -657,6 +686,9 @@ def train_one_run(
         "effective_balance_degree": float(subset_meta.get("effective_balance_degree", 0.0)),
         "train_used_rows": int(len(train_used)),
         "train_used_class_counts": run_config["train_used_class_counts"],
+        "train_unique_rows": run_config["train_unique_rows"],
+        "train_unique_class_counts": run_config["train_unique_class_counts"],
+        "train_repeated_rows": run_config["train_repeated_rows"],
         "selection_metric": cfg.selection_metric,
         "best_selection_score": float(best_score),
         "best_epoch": int(best_epoch),
@@ -726,6 +758,9 @@ def _summary_rows(results: list[dict[str, Any]], train_full_n: int) -> pd.DataFr
             "raw_balance_degree": r["raw_balance_degree"],
             "effective_balance_degree": r["effective_balance_degree"],
             "train_used_rows": r["train_used_rows"],
+            "train_unique_rows": r["train_unique_rows"],
+            "train_repeated_rows": r["train_repeated_rows"],
+            **{f"train_unique_{name}": r["train_unique_class_counts"][name] for name in CLASS_NAMES},
             "train_routine": r["train_used_class_counts"]["routine"],
             "train_follow_up": r["train_used_class_counts"]["follow_up"],
             "train_biopsy": r["train_used_class_counts"]["biopsy"],
@@ -758,6 +793,11 @@ def _mean_summary(df: pd.DataFrame) -> pd.DataFrame:
         "raw_balance_degree",
         "effective_balance_degree",
         "train_used_rows",
+        "train_unique_rows",
+        "train_repeated_rows",
+        "train_unique_routine",
+        "train_unique_follow_up",
+        "train_unique_biopsy",
         "train_routine",
         "train_follow_up",
         "train_biopsy",
@@ -933,6 +973,9 @@ def run_transfer(cfg: ExperimentConfig) -> None:
                 {
                     k: {
                         "rows": v["rows"],
+                        "unique_rows": v["unique_rows"],
+                        "unique_class_counts": v["unique_class_counts"],
+                        "repeated_rows": v["repeated_rows"],
                         "raw_balance_degree": v["raw_balance_degree"],
                         "effective_balance_degree": v["effective_balance_degree"],
                         "actual_counts": v["actual_counts"],

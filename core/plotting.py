@@ -243,7 +243,7 @@ def _plot_metric_curve(mean_df: pd.DataFrame, metric: str, ylabel: str, title: s
         sub = sub.sort_values("budget_numeric")
         plt.plot(sub["budget_numeric"], sub[metric], marker="o", label=mode)
     plt.xscale("log")
-    plt.xlabel("Labeled train samples")
+    plt.xlabel("Training entries (including repeats)")
     plt.ylabel(ylabel)
     plt.title(title)
     plt.grid(alpha=0.3)
@@ -289,7 +289,7 @@ def plot_summary_outputs(df: pd.DataFrame, mean_df: pd.DataFrame, out_dir: Path)
             ax.plot(sub["budget_numeric"], sub[metric], marker="o", label=mode)
         ax.set_xscale("log")
         ax.set_title(f"{class_name} recall")
-        ax.set_xlabel("Labeled samples")
+        ax.set_xlabel("Training entries (including repeats)")
         ax.set_ylim(0, 1)
         ax.grid(alpha=0.3)
         if i == 0:
@@ -306,7 +306,7 @@ def plot_summary_outputs(df: pd.DataFrame, mean_df: pd.DataFrame, out_dir: Path)
         sub = sub.sort_values("budget_numeric")
         plt.plot(sub["budget_numeric"], sub["best_epoch"], marker="o", label=mode)
     plt.xscale("log")
-    plt.xlabel("Labeled train samples")
+    plt.xlabel("Training entries (including repeats)")
     plt.ylabel("Best epoch")
     plt.title("Best checkpoint epoch")
     plt.grid(alpha=0.3)
@@ -315,54 +315,79 @@ def plot_summary_outputs(df: pd.DataFrame, mean_df: pd.DataFrame, out_dir: Path)
     plt.savefig(out_dir / "summary_best_epoch.png", dpi=200)
     plt.close()
 
-    # Subset schedule is identical across modes for a seed; average across duplicates/modes.
-    schedule = (
-        df.groupby(["budget", "budget_numeric"], as_index=False)[
-            [
-                "effective_balance_degree",
-                "train_routine",
-                "train_follow_up",
-                "train_biopsy",
+    if (df["subset_strategy"] == "oversampling").all():
+        for name in ("summary_balance_degree.png", "summary_subset_class_composition.png"):
+            (out_dir / name).unlink(missing_ok=True)
+        # Selection is shared across modes. Count each seed/budget only once.
+        schedule = df.drop_duplicates(["seed", "budget"]).groupby(
+            ["budget", "budget_numeric"], as_index=False
+        )[[f"train_unique_{name}" for name in CLASS_NAMES] + ["train_unique_rows", "train_repeated_rows"]].mean()
+        schedule = schedule.sort_values("budget_numeric")
+        x = np.arange(len(schedule))
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        for i, name in enumerate(CLASS_NAMES):
+            axes[0].bar(x + (i - 1) * 0.25, schedule[f"train_unique_{name}"], width=0.25, label=name)
+        axes[0].set(title="Unique images per class", ylabel="Unique training images (mean across seeds)")
+        axes[1].bar(x, schedule["train_unique_rows"], label="Unique images")
+        axes[1].bar(x, schedule["train_repeated_rows"], bottom=schedule["train_unique_rows"], label="Repeated entries")
+        axes[1].set(title="Training entries: unique and repeated", ylabel="Number of entries")
+        for ax in axes:
+            ax.set_xticks(x, schedule["budget"].astype(str))
+            ax.set_xlabel("Training-entry budget (including repeats)")
+            ax.legend()
+        fig.tight_layout()
+        fig.savefig(out_dir / "summary_sampling_unique_images.png", dpi=200)
+        plt.close(fig)
+    else:
+        # Subset schedule is identical across modes for a seed; average across duplicates/modes.
+        (out_dir / "summary_sampling_unique_images.png").unlink(missing_ok=True)
+        schedule = (
+            df.groupby(["budget", "budget_numeric"], as_index=False)[
+                [
+                    "effective_balance_degree",
+                    "train_routine",
+                    "train_follow_up",
+                    "train_biopsy",
+                ]
             ]
-        ]
-        .mean()
-        .sort_values("budget_numeric")
-    )
+            .mean()
+            .sort_values("budget_numeric")
+        )
 
-    plt.figure(figsize=(8, 5))
-    plt.plot(
-        schedule["budget_numeric"],
-        schedule["effective_balance_degree"],
-        marker="o",
-    )
-    plt.xscale("log")
-    plt.xlabel("Labeled train samples")
-    plt.ylabel("Effective balance degree")
-    plt.ylim(-0.03, 1.03)
-    plt.title("Progressive balance schedule")
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_dir / "summary_balance_degree.png", dpi=200)
-    plt.close()
+        plt.figure(figsize=(8, 5))
+        plt.plot(
+            schedule["budget_numeric"],
+            schedule["effective_balance_degree"],
+            marker="o",
+        )
+        plt.xscale("log")
+        plt.xlabel("Training entries (including repeats)")
+        plt.ylabel("Effective balance degree")
+        plt.ylim(-0.03, 1.03)
+        plt.title("Progressive balance schedule")
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(out_dir / "summary_balance_degree.png", dpi=200)
+        plt.close()
 
-    # Normalized class composition across budgets.
-    total = (schedule["train_routine"] + schedule["train_follow_up"] + schedule["train_biopsy"]).to_numpy()
-    x = np.arange(len(schedule))
-    routine = schedule["train_routine"].to_numpy() / total
-    follow = schedule["train_follow_up"].to_numpy() / total
-    biopsy = schedule["train_biopsy"].to_numpy() / total
-    plt.figure(figsize=(9, 5))
-    plt.bar(x, routine, label="routine")
-    plt.bar(x, follow, bottom=routine, label="follow_up")
-    plt.bar(x, biopsy, bottom=routine + follow, label="biopsy")
-    plt.xticks(x, schedule["budget"].astype(str).tolist())
-    plt.xlabel("Label budget")
-    plt.ylabel("Fraction of training subset")
-    plt.title("Training-subset class composition")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_dir / "summary_subset_class_composition.png", dpi=200)
-    plt.close()
+        # Normalized class composition across budgets.
+        total = (schedule["train_routine"] + schedule["train_follow_up"] + schedule["train_biopsy"]).to_numpy()
+        x = np.arange(len(schedule))
+        routine = schedule["train_routine"].to_numpy() / total
+        follow = schedule["train_follow_up"].to_numpy() / total
+        biopsy = schedule["train_biopsy"].to_numpy() / total
+        plt.figure(figsize=(9, 5))
+        plt.bar(x, routine, label="routine")
+        plt.bar(x, follow, bottom=routine, label="follow_up")
+        plt.bar(x, biopsy, bottom=routine + follow, label="biopsy")
+        plt.xticks(x, schedule["budget"].astype(str).tolist())
+        plt.xlabel("Training-entry budget")
+        plt.ylabel("Fraction of training subset")
+        plt.title("Training-subset class composition")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_dir / "summary_subset_class_composition.png", dpi=200)
+        plt.close()
 
     # Predicted class fractions at the selected checkpoints. This exposes class collapse.
     plt.figure(figsize=(12, 4))
@@ -379,7 +404,7 @@ def plot_summary_outputs(df: pd.DataFrame, mean_df: pd.DataFrame, out_dir: Path)
         ax.set_xscale("log")
         ax.set_ylim(0, 1)
         ax.set_title(mode)
-        ax.set_xlabel("Labeled samples")
+        ax.set_xlabel("Training entries (including repeats)")
         ax.grid(alpha=0.3)
         if i == 0:
             ax.set_ylabel("Predicted test fraction")

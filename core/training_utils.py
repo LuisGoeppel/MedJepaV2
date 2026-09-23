@@ -210,7 +210,9 @@ def setup_distributed() -> tuple[bool, int, int, int, torch.device]:
         device = torch.device("cuda", local_rank)
         return True, rank, world_size, local_rank, device
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # CUDA APIs such as mem_get_info require an explicit index on some PyTorch
+    # versions. Preserve the current device rather than assuming GPU zero.
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
     return False, 0, 1, 0, device
 
 

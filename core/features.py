@@ -97,7 +97,7 @@ def run_analysis(
 
     validate_bin(paths["bin"], len(full_raw), model_cfg.image_height, model_cfg.image_width, model_cfg.memmap_dtype)
     frames = {"train": train, "val": val, "test": test}
-    names = set(frames) if settings.probe.enabled else set()
+    names = ({"train", "val", "test"} if settings.probe.evaluate_test else {"train", "val"}) if settings.probe.enabled else set()
 
     if settings.pca.enabled:
         names.update(frames if settings.pca.split == "all" else [settings.pca.split])
@@ -139,9 +139,12 @@ def run_analysis(
         )
 
     if settings.pca.enabled:
-        from .pca import run_pca_report
+        from .pca import run_pca_report, run_compact_pca
 
-        run_pca_report(features, settings.pca, settings.seed, str(checkpoint), out / "pca_report.pdf")
+        if settings.pca.output_format == "compact":
+            run_compact_pca(features, settings.pca, settings.seed, out)
+        else:
+            run_pca_report(features, settings.pca, settings.seed, str(checkpoint), out / "pca_report.pdf")
 
     if settings.probe.enabled:
         from .probe import run_probe_report

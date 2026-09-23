@@ -1,0 +1,74 @@
+{
+  "schema_version": "medjepa_v7_config_0.1",
+  "run": {
+    "name": "mg_projection_sigreg_sweep",
+    "description": "Nine 50-epoch Hologic/Lorad runs comparing projection dimension and SIGReg weight.",
+    "output_dir": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/luis/runs/mg_projection_sigreg_sweep",
+    "seed": 42,
+    "save_resolved_config": true
+  },
+  "paths": {
+    "full_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/mg-only-all.csv",
+    "bin": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/mg-only-all.bin",
+    "train_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_train.csv",
+    "val_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_val.csv",
+    "test_csv": "/pfss/mlde/workspaces/mlde_wsp_PI_Roig/shared/datasets/breastTumor/mg/splits_hologic_lorad/mg_test.csv",
+    "augmentation_config": "mg_lejepa_aug_v4.json"
+  },
+  "model": {
+    "backbone_name": "vit_base_patch16_224",
+    "image_size": 224,
+    "backbone_output_dim": 512,
+    "projection_dim": [16, 64, 128],
+    "projector_hidden_dim": 2048,
+    "drop_path_rate": 0.1,
+    "image_height": 512,
+    "image_width": 512,
+    "memmap_dtype": "uint16",
+    "normalize_mode": "uint16",
+    "percentile_low": 1.0,
+    "percentile_high": 99.0
+  },
+  "training": {"epochs": 50, "batch_size": 128, "num_views": 4, "num_workers": 4, "grad_accum_steps": 1},
+  "optimizer": {
+    "learning_rate": 0.0001,
+    "weight_decay": 0.05,
+    "warmup_epochs": 10,
+    "min_learning_rate": 0.00001,
+    "grad_clip_norm": 0.0
+  },
+  "loss": {
+    "lambda_sigreg": [0.01, 0.02, 0.05],
+    "sigreg_knots": 17,
+    "sigreg_num_projections": 1024,
+    "sigreg_mode": "pooled_views",
+    "sigreg_normalize_by_n": false,
+    "projection_normalization": "sqrt_dim"
+  },
+  "distributed": {"no_cuda_timing_sync": true},
+  "checkpointing": {"checkpoint_every_epochs": 50, "resume_checkpoint": null},
+  "diagnostics": {"diagnostic_every_batches": 50},
+  "analysis": {
+    "seed": 42,
+    "feature_extraction": {"batch_size": 256, "num_workers": 4, "save_features": false},
+    "pca": {
+      "enabled": true,
+      "output_format": "compact",
+      "split": "val",
+      "max_samples": 1998,
+      "sampling": "balanced_collapsed",
+      "color_by": ["collapsed_birads"]
+    },
+    "probe": {
+      "enabled": true,
+      "targets": ["collapsed_birads"],
+      "probe_epochs": 50,
+      "probe_batch_size": 1024,
+      "probe_learning_rate": 0.001,
+      "probe_weight_decay": 0.0000001,
+      "probe_train_max_samples": 60000,
+      "select_best_by": "val_balanced_accuracy",
+      "evaluate_test": false
+    }
+  }
+}

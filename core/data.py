@@ -215,12 +215,44 @@ def ensure_original_index(split_df: pd.DataFrame, full_df_raw: pd.DataFrame, spl
         if "id" not in df or "id" not in full_df_raw:
             raise ValueError(f"{split_name}: original_index or a unique id is required")
         ids = full_df_raw["id"].astype(str)
-        if ids.duplicated().any():
-            raise ValueError(
-                f"{split_name}: full CSV has duplicate ids; supply original_index to avoid ambiguous image matching"
+        unique = ~ids.duplicated(keep=False) & full_df_raw["id"].notna()
+        mapping = pd.Series(np.arange(len(full_df_raw))[unique], index=ids[unique])
+        split_ids = df["id"].astype(str)
+        df["original_index"] = split_ids.map(mapping)
+        duplicated = split_ids.isin(ids[~unique]) & df["id"].notna()
+        if duplicated.any():
+            # Only raw source fields identify images. Derived labels and split
+            # annotations may have changed since the original CSV was written.
+            columns = [c for c in (
+                "id", "patient", "dataset", "modality", "machine", "exam",
+                "segmentation", "context", "findings", "original_birads", "birads", "race",
+            ) if c in df and c in full_df_raw]
+            full_keys = full_df_raw.loc[~unique, columns].copy()
+            split_keys = df.loc[duplicated, columns].copy()
+            for column in columns:
+                # CSV inference can turn an integer field into a float when
+                # another row is missing. Do not alter text IDs or context JSON.
+                numeric = pd.api.types.is_numeric_dtype(full_keys[column]) and pd.api.types.is_numeric_dtype(split_keys[column])
+                full_keys[column] = full_keys[column].astype("string")
+                split_keys[column] = split_keys[column].astype("string")
+                if numeric:
+                    full_keys[column] = full_keys[column].str.replace(r"^(-?\d+)\.0+$", r"\1", regex=True)
+                    split_keys[column] = split_keys[column].str.replace(r"^(-?\d+)\.0+$", r"\1", regex=True)
+            unambiguous = ~full_keys.duplicated(keep=False)
+            index_by_metadata = pd.Series(
+                np.arange(len(full_df_raw))[~unique][unambiguous],
+                index=pd.MultiIndex.from_frame(full_keys.loc[unambiguous]),
             )
-        mapping = pd.Series(np.arange(len(full_df_raw)), index=ids)
-        df["original_index"] = df["id"].astype(str).map(mapping)
+            matched = index_by_metadata.reindex(pd.MultiIndex.from_frame(split_keys)).to_numpy()
+            if pd.isna(matched).any():
+                raise ValueError(
+                    f"{split_name}: full CSV has duplicate ids; {int(pd.isna(matched).sum())} split rows "
+                    f"remain ambiguous or unmatched using shared metadata {columns}. "
+                    "Supply original_index from the original full CSV row positions; "
+                    "do not deduplicate the full CSV or renumber the split."
+                )
+            df.loc[duplicated, "original_index"] = matched
+            print(f"Mapped {int(duplicated.sum())} {split_name} rows with duplicate ids using {columns}", flush=True)
     index = pd.to_numeric(df["original_index"], errors="coerce")
     valid = index.notna() & (index >= 0) & (index < len(full_df_raw)) & (index == np.floor(index))
     if not valid.all():

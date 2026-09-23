@@ -36,6 +36,67 @@ python run_transfer_experiment.py --run-config config/transfer.json
 
 Edit the checkpoint, dataset and output paths in the example configurations for your environment. The transfer command also accepts the previous experiment's CLI flags; explicitly supplied flags override JSON settings.
 
+For balanced transfer training with a fixed number of **total entries**, set `"subset_strategy": "oversampling"` in the transfer JSON, or pass `--subset-strategy oversampling`. The existing `progressive`, `balanced` and `natural` strategies retain their behavior and defaults. `balance_curve` is ignored for oversampling.
+
+Oversampling divides each budget equally among routine, follow-up and biopsy (counts differ by at most one). Each class uses unique shuffled images first, then repeats images drawn from that class when its supply is exhausted. The subsets and repeated-entry multiplicities are nested across budgets and identical across transfer modes for a given seed. An absent class is an error. No validation or test images are oversampled. Existing class weighting is retained and computed from the constructed training-entry counts, so it is approximately uniform with balanced oversampling.
+
+A `10k` point contains 10,000 entries, including repeats, not 10,000 unique labels plus extra entries. As with existing strategies, budgets exceeding the full training size are capped at that size. `full` uses the original training split's row count as its entry budget but is balanced; it does **not** include every unique majority-class image. Equal budgets preserve entries/batches per epoch at the same batch size. Early stopping and other training settings remain unchanged, so total optimizer steps across complete runs can still differ. Treat this as a fixed-training-entry comparison, and use reported unique counts when discussing annotation efficiency.
+
+Subset manifests, per-run results and summary CSVs record total entries, unique counts per class and repeated entries. For oversampling, `summary_sampling_unique_images.png` replaces the balance-degree and subset-composition summaries with unique images per class and unique-versus-repeated totals. Metric plot axes refer to training entries. Use a separate output directory when comparing strategies so results and old plots are not overwritten or mixed.
+
+## Sequential training sweeps
+
+`run_training_sweep.py` accepts one training JSON. Scalar training fields are fixed; arrays form a Cartesian product. The example `config/mg_projection_sigreg_sweep.json` runs nine 50-epoch experiments: projection dimensions `[16, 64, 128]` and SIGReg weights `[0.01, 0.02, 0.05]`, with a ViT-base learned 512-dimensional backbone head. Set `run.seed` to an array to repeat every combination across seeds. With no arrays, it runs one experiment.
+
+```bash
+# Validate configuration and inspect all combinations, without accessing cluster data or writing outputs:
+python run_training_sweep.py --run-config config/mg_projection_sigreg_sweep.json --dry-run
+
+# Run sequentially (training followed by analysis for each experiment):
+python run_training_sweep.py --run-config config/mg_projection_sigreg_sweep.json
+
+# Optional: each experiment uses two GPUs; experiments are still sequential:
+python run_training_sweep.py --run-config config/mg_projection_sigreg_sweep.json --nproc-per-node 2
+
+# Continue an interrupted sweep using the original config and GPU process count:
+python run_training_sweep.py --run-config config/mg_projection_sigreg_sweep.json --resume
+
+# Rebuild comparisons from saved results, without training or reading the dataset:
+python run_training_sweep.py --run-config config/mg_projection_sigreg_sweep.json --reports-only
+```
+
+Launch the controller with `python`, not `torchrun`; it launches DDP workers when requested. Global batch sizes must divide evenly across workers. The sweep CLI uses a whitelist of supported scalar training fields and rejects empty/duplicate arrays, unknown fields and invalid values before launching jobs. Dataset paths, run name/output directory, and analysis settings are shared across runs; only `run.seed` varies within the `run` section. Arrays such as `analysis.probe.targets` retain their usual meaning.
+
+The example embeds an `analysis` section, so no second user-maintained config is needed. Alternatively, use `paths.analysis_config` instead of that section. A fixed analysis seed ensures identical probe sampling and PCA image identities across experiments, even when training seeds vary. PCA and probes reuse backbone embeddings from the same extraction pass. Sweep reports require compact PCA on train or validation data. Other analysis entry points also support `pca.output_format: "compact"`; their default remains the existing PDF report.
+
+The example probes collapsed BI-RADS and ranks individual runs by **validation balanced accuracy**, with macro-F1 alongside it. It sets `probe.evaluate_test: false`, so test embeddings are not extracted and test metrics are omitted. Test CSVs are still read for split-integrity validation. Enable test evaluation only for a separate final evaluation of selected models. The 50-epoch budget is an experimental setting, not a guarantee of convergence. Heatmaps average completed training seeds and show counts and standard deviations; partially completed seed groups should not be treated as a final ranking. `selection.json` identifies the best individual runs, not a seed-aggregated hyperparameter winner.
+
+```text
+<sweep output>/
+    sweep_manifest.json           # parameters, status, errors, elapsed time, input identities
+    analysis_config.json          # generated snapshot
+    augmentation_config.json      # generated snapshot
+    run_001/                      # unique directory per combination
+        run_config.json           # generated scalar training config
+        process.log
+        models/, metrics/, plots/
+        analysis/
+            linear_probe_report.json
+            pca.png
+            pca_coordinates.npz
+            analysis_metadata.json
+    comparison/
+        results.csv, results.json, status.csv, selection.json
+        probe_collapsed_birads.png
+        heatmap_collapsed_birads.png
+        pca_comparison_01.png
+        training_diagnostics.png
+```
+
+Comparison reports update after each attempt. Two non-seed sweep axes produce metric heatmaps; other grids still produce per-run metric plots and PCA panels. PCA panels use identical samples but independently fitted axes, so absolute coordinates are not comparable. Training diagnostics show loss components, embedding/projection standard deviations, effective rank and epoch timing; total weighted SSL loss is not used to select a winner.
+
+Completed runs are skipped on `--resume`. Failed runs do not stop subsequent experiments, but the controller exits with a nonzero status if any remain failed. If training finished and wrote its final checkpoint and summary, a retry runs analysis only; an interrupted training run restarts from epoch one. Automatic continuation from intermediate optimizer checkpoints is not implemented. Config/input identity changes require a new output directory, and generated config snapshots must remain unmodified. Normal interruption releases `.sweep.lock`; after a forcibly killed controller, remove a stale lock only after confirming its workers have stopped. Upload this script and the updated `core/` together with the config.
+
 ## Supervised baselines
 
 The three supervised experiments live in `supervised/`. Run them as modules from this folder (or install the project first). Their existing CLI flags are retained:
@@ -151,7 +212,7 @@ These corrections are intentional and can affect comparisons with old reports:
 - Analysis reconstructs both headless and learned-head backbones and loads model weights strictly. It will not continue with randomly initialized missing weights. Supply a full training checkpoint containing `model_state_dict`, `config` and `augmentation_config`; bare state dictionaries are not sufficient for standalone analysis.
 - Analysis now applies the same deterministic foreground crop and corner mask as training and transfer. Old PCA/probe scripts omitted the corner mask.
 - Metadata uses one canonical view/laterality/machine-family mapping. Training keeps its numeric BI-RADS label policy; transfer retains its preference for an existing valid `collapsed_birads` column.
-- Binary shape uses the raw CSV row count, before label filtering. Split indices must be in bounds and unambiguous; duplicate IDs require explicit `original_index`. Missing patient identifiers, repeated image rows and overlapping splits fail validation.
+- Binary shape uses the raw CSV row count, before label filtering. Split indices must be in bounds and unambiguous. Without `original_index`, unique IDs map directly to physical rows; duplicate IDs are matched using all shared raw identity metadata (patient, dataset, modality, machine, context, findings and source labels where available). Every requested row must have exactly one match. Remaining ambiguous or unmatched duplicate IDs require explicit `original_index` from the original full CSV; never deduplicate the full CSV or assign split-relative row numbers, because that breaks BIN alignment. Missing patient identifiers, repeated image rows and overlapping splits fail validation.
 
 ## Environment and checks
 
